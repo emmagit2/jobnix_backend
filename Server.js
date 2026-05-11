@@ -49,6 +49,28 @@ app.get("/", (req, res) => {
 
 
 // =============================
+// HEALTH CHECK ROUTE
+// =============================
+app.get("/health", async (req, res) => {
+  try {
+    return res.status(200).json({
+      success: true,
+      status: "healthy",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || "development",
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      status: "unhealthy",
+      error: error.message,
+    });
+  }
+});
+
+
+// =============================
 // 404 HANDLER
 // =============================
 app.use((req, res) => {
