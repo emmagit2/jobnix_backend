@@ -5,11 +5,12 @@ import cookieParser from "cookie-parser";
 
 import jobRoutes from "./route/jobRoutes.js";
 import analyticsRoutes from "./route/analyticsRoutes.js";
+import companyRoutes from "./route/companyRoutes.js";
 
 dotenv.config();
 
 const app = express();
-
+    
 
 // =============================
 // MIDDLEWARE
@@ -35,6 +36,7 @@ app.use(cookieParser());
 // =============================
 app.use("/api/jobs", jobRoutes);
 app.use("/api/analytics", analyticsRoutes);
+app.use("/api/companies", companyRoutes);
 
 
 // =============================
@@ -42,9 +44,9 @@ app.use("/api/analytics", analyticsRoutes);
 // =============================
 app.get("/", (req, res) => {
   res.json({
-    success: true,
+    success: true, 
     message: "Job API is running 🚀",
-  });
+  }); 
 });
 
 
