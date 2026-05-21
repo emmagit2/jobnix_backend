@@ -2,17 +2,21 @@ import { supabase } from "../config/supabase.js";
 
 const adminCheck = async (req, res, next) => {
   try {
-    const token = req.headers.authorization;
+    const authHeader = req.headers.authorization;
 
-    if (!token) {
+    if (!authHeader) {
       return res.status(401).json({
         success: false,
         message: "No token provided",
       });
     }
 
-    const { data: { user }, error } =
-      await supabase.auth.getUser(token);
+    // Strip "Bearer " prefix if present
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : authHeader;
+
+    const { data: { user }, error } = await supabase.auth.getUser(token);
 
     if (error || !user) {
       return res.status(401).json({
@@ -21,7 +25,7 @@ const adminCheck = async (req, res, next) => {
       });
     }
 
-    // 🔥 GET PROFILE FROM DATABASE
+    // GET PROFILE FROM DATABASE
     const { data: profile, error: profileError } = await supabase
       .from("profiles")
       .select("*")
@@ -35,7 +39,7 @@ const adminCheck = async (req, res, next) => {
       });
     }
 
-    // 🔥 CHECK ROLE IN DATABASE
+    // CHECK ROLE IN DATABASE
     if (profile.role !== "admin") {
       return res.status(403).json({
         success: false,
@@ -45,9 +49,7 @@ const adminCheck = async (req, res, next) => {
 
     req.user = user;
     req.profile = profile;
-
     next();
-
   } catch (err) {
     return res.status(500).json({
       success: false,
