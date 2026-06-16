@@ -8,11 +8,11 @@ function generateSlug(title, company, location, shortId) {
 
   const base = parts
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")   // remove special chars
-    .replace(/\s+/g, "-")           // spaces → hyphens
-    .replace(/-+/g, "-")            // collapse double hyphens
-    .replace(/^-|-$/g, "")          // trim edges
-    .slice(0, 74);                  // leave room for shortId
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 74);
 
   return `${base}-${shortId}`;
 }
@@ -137,11 +137,10 @@ export const getJobs = async (req, res) => {
 };
 
 // ─── GET JOB BY ID or SLUG ────────────────────────────────────────────────────
-// Now accepts both /jobs/some-slug  AND  /jobs/uuid-uuid-uuid
 export const getJobById = async (req, res) => {
   try {
     const { id } = req.params;
-    const data = await getFullJobBySlugOrId(id);   // ← updated helper
+    const data = await getFullJobBySlugOrId(id);
     if (!data) {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
@@ -155,11 +154,14 @@ export const getJobById = async (req, res) => {
 export const createJob = async (req, res) => {
   try {
     const {
-      title, company_id, location, role_category, job_type,
+      title, company_id: rawCompanyId, location, role_category, job_type,
       description, requirements, responsibilities, benefits,
       salary_min, salary_max, salary_currency,
       apply_link, apply_email, how_to_apply, deadline,
     } = req.body;
+
+    // ✅ Strip "__other__" sentinel — store null instead
+    const company_id = (rawCompanyId && rawCompanyId !== "__other__") ? rawCompanyId : null;
 
     // ── Fetch company name for the slug ──────────────────────────────
     let companyName = "";
@@ -173,7 +175,7 @@ export const createJob = async (req, res) => {
     }
 
     // ── Generate unique slug ─────────────────────────────────────────
-    const shortId = Math.random().toString(36).slice(2, 8); // e.g. "k3x9mz"
+    const shortId = Math.random().toString(36).slice(2, 8);
     const slug = generateSlug(title, companyName, location, shortId);
 
     const { data, error } = await supabase
@@ -186,7 +188,7 @@ export const createJob = async (req, res) => {
         benefits,
         salary_min, salary_max, salary_currency,
         apply_link, apply_email, how_to_apply, deadline,
-        slug,           // ← slug saved here
+        slug,
       }])
       .select()
       .single();
@@ -207,11 +209,14 @@ export const updateJob = async (req, res) => {
   try {
     const { id } = req.params;
     const {
-      title, company_id, location, role_category, job_type,
+      title, company_id: rawCompanyId, location, role_category, job_type,
       description, requirements, responsibilities, benefits,
       salary_min, salary_max, salary_currency,
       apply_link, apply_email, how_to_apply, deadline,
     } = req.body;
+
+    // ✅ Strip "__other__" sentinel — store null instead
+    const company_id = (rawCompanyId && rawCompanyId !== "__other__") ? rawCompanyId : null;
 
     // ── Re-generate slug on update so it stays in sync with title/location ──
     let companyName = "";
@@ -231,7 +236,6 @@ export const updateJob = async (req, res) => {
       .eq("id", id)
       .single();
 
-    // Extract the last 6-char shortId from existing slug, or make a new one
     const existingShortId = existing?.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
     const slug = generateSlug(title, companyName, location, existingShortId);
 
@@ -245,7 +249,7 @@ export const updateJob = async (req, res) => {
         benefits,
         salary_min, salary_max, salary_currency,
         apply_link, apply_email, how_to_apply, deadline,
-        slug,           // ← slug updated here too
+        slug,
       })
       .eq("id", id);
 
