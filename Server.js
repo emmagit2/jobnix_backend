@@ -5,6 +5,7 @@ import cookieParser from "cookie-parser";
 import jobRoutes from "./route/jobRoutes.js";
 import analyticsRoutes from "./route/analyticsRoutes.js";
 import companyRoutes from "./route/companyRoutes.js";
+import aiRoutes from "./route/ai.js";
 
 dotenv.config();
 
@@ -25,12 +26,14 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 };
 
+
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 app.use(express.json());
 app.use(cookieParser());
 
+app.use("/api/ai", aiRoutes);
 app.use("/api/jobs",      jobRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/companies", companyRoutes);
