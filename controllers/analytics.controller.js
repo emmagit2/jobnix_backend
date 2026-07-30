@@ -45,6 +45,10 @@ export const jobClickController = async (req, res) => {
     // sent a valid Supabase access token — otherwise it stays null.
     const userId = await getOptionalUserId(req);
 
+    // event_type distinguishes a page view from an apply-button click.
+    // Defaults to "view" for safety if an older client ever omits it.
+    const eventType = req.body.event_type === "apply_click" ? "apply_click" : "view";
+
     const result = await trackJobClick({
       job_id:        req.body.job_id,
       job_title:     req.body.job_title,
@@ -54,6 +58,7 @@ export const jobClickController = async (req, res) => {
       referrer:      req.body.referrer || "direct",
       visitor_id:    visitorId,
       user_id:       userId,
+      event_type:    eventType,
     });
 
     return res.status(201).json({ success: true, data: result });
@@ -87,6 +92,20 @@ export const analyticsOverviewController = async (req, res) => {
       jobMap[c.job_id].count++;
     });
     const topJobs = Object.values(jobMap).sort((a, b) => b.count - a.count);
+
+    // ── Per-job view vs apply-click counts (for the admin JobRow pills).
+    // Unlike topJobs above, this is NOT deduped per visitor — every view
+    // event and every apply_click event counts, since JobRow wants raw
+    // totals, not unique-visitor totals.
+    const jobCounts = {};
+    clicks.forEach((c) => {
+      if (!c.job_id) return;
+      if (!jobCounts[c.job_id]) {
+        jobCounts[c.job_id] = { view: 0, apply_click: 0 };
+      }
+      const type = c.event_type === "apply_click" ? "apply_click" : "view";
+      jobCounts[c.job_id][type]++;
+    });
 
     // ── Locations
     const locationMap = {};
@@ -157,6 +176,7 @@ export const analyticsOverviewController = async (req, res) => {
       data: {
         totalClicks: clicks.length,
         topJobs,
+        jobCounts,
         topLocations,
         topCategories,
         topReferrers,
