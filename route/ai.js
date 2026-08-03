@@ -112,13 +112,32 @@ const upload = multer({
 });
 
 // ── Schemas ───────────────────────────────────────────────────────────────
+// ✅ CHANGED: added first_name/last_name as their own fields — the frontend
+// (ProfileSetup.jsx's handleParsed) used to get only full_name and split it
+// in JS (full_name.split(" ")[0] / rest), which breaks for single names,
+// middle names, and hyphenated surnames. Gemini already has to identify the
+// name as structured data internally to extract it — asking it to also
+// split first/last directly is far more reliable than re-splitting a string
+// afterwards. full_name is kept for anywhere that still wants the combined
+// display form.
 const CV_SCHEMA = {
   type: "object",
   properties: {
+    first_name: { type: "string" },
+    last_name: { type: "string" },
     full_name: { type: "string" },
     email: { type: "string" },
     phone: { type: "string" },
     location: { type: "string" },
+    // ✅ ADDED: city/state/country broken out separately. The frontend's
+    // City/State/Country fields are select-from-list now (matched against
+    // a Nigerian states/cities dataset), not free text — a single raw
+    // `location` string like "Lagos, Nigeria" can't be reliably matched
+    // against that list. Structured fields let the frontend match each
+    // one individually instead of guessing how to split one string.
+    city: { type: "string" },
+    state: { type: "string" },
+    country: { type: "string" },
     headline: { type: "string" },
     years_of_experience: { type: "number" },
     skills: { type: "array", items: { type: "string" } },
@@ -152,7 +171,10 @@ const CV_SCHEMA = {
     certifications: { type: "array", items: { type: "string" } },
     languages: { type: "array", items: { type: "string" } },
   },
-  required: ["full_name", "skills", "experience"],
+  // ✅ CHANGED: first_name/last_name required alongside full_name so the
+  // frontend can always trust the split fields are present rather than
+  // needing its full_name-splitting fallback.
+  required: ["first_name", "last_name", "full_name", "skills", "experience"],
 };
 
 const MATCH_SCHEMA = {
@@ -220,11 +242,37 @@ router.post("/parse", upload.single("cv"), async (req, res) => {
       return res.status(400).json({ message: "No PDF file uploaded (field name must be 'cv')." });
     }
 
+    // ✅ CHANGED: explicit first_name/last_name splitting rules — Gemini
+    // decides the split once, correctly, instead of the frontend guessing
+    // by splitting on the first space.
+    //
+    // ✅ FIXED: this whole prompt is a template literal (backtick string).
+    // The line about "location" used LITERAL BACKTICKS around the word
+    // (`location`) as inline-code-style emphasis — those backticks closed
+    // the template literal early, and the bare word `location` right after
+    // was parsed as JavaScript code, which is exactly what crashed the
+    // server with "Unexpected identifier 'location'". Switched to double
+    // quotes so nothing inside the string can terminate it early.
     const promptText = `You are an expert technical recruiter and resume parser.
 Extract structured information from the attached resume PDF and return it
 according to the schema.
 
 Rules:
+- Split the candidate's name into first_name and last_name. Use your best
+  judgment for names with a middle name (fold it into first_name, e.g.
+  "Mary Ann" -> first_name "Mary Ann"), a single name (put it in first_name,
+  leave last_name empty), or a hyphenated/multi-word surname (keep it whole
+  in last_name, e.g. "Ade-Bello" or "van der Berg").
+- Also return full_name as the natural full display form of the name (not
+  necessarily just first_name + " " + last_name if the source formats it
+  differently, e.g. with a middle name included).
+- Also return the candidate's location broken into city, state, and
+  country separately, in addition to the combined "location" string. Use
+  standard English names (e.g. country "Nigeria" not "NG"; for Nigerian
+  addresses, state should be the full state name, e.g. "Lagos" not "Lagos
+  State" — omit "State"/"FCT" suffixes except write the federal capital
+  territory as "FCT (Abuja)"). If a resume only gives a city, leave state/
+  country empty rather than guessing.
 - Normalize skills to clean, deduplicated Title Case entries.
 - Separate soft/professional skills from concrete tools/technologies where possible.
 - If a field is not present, omit it or use an empty array/string. Don't invent data.
