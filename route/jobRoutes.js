@@ -1,5 +1,4 @@
 import express from "express";
-
 import {
   getJobs,
   getJobById,
@@ -7,25 +6,71 @@ import {
   updateJob,
   deleteJob,
   toggleFeaturedJob,
+  incrementJobView,
+  incrementJobClick,
+  applyToJob,
+  getMyJobs,
+  getJobStats,
+  getJobApplicants,
+  submitInformalJob,
+  confirmInformalJobPayment,
+  getPendingJobs,
+  approveJob,
+  rejectJob,
 } from "../controllers/jobController.js";
-
 import adminCheck from "../middleware/adminCheck.js";
+import requireAuth from "../middleware/requireAuth.js";
+import requireBusinessAccount from "../middleware/requireBusinessAccount.js";
 
 const router = express.Router();
 
 // =============================
-// PUBLIC ROUTES
+// PUBLIC / BUSINESS ROUTES
 // =============================
+// Single-segment paths ("/mine", "/informal", "/pending") MUST all be
+// registered before the generic "/:id" below — otherwise Express matches
+// them as GET/POST /:id with id="mine"/"informal"/"pending" and the real
+// handler never runs.
+
+router.get("/mine", [requireAuth, requireBusinessAccount], getMyJobs);
+
+// Business (or agent acting for a business) submits an informal job —
+// always lands as status "pending" + payment_status "pending". Never goes
+// live until payment is confirmed AND an admin approves it.
+router.post("/informal", [requireAuth, requireBusinessAccount], submitInformalJob);
+
+// Admin queue: informal jobs that are paid and awaiting review.
+router.get("/pending", adminCheck, getPendingJobs);
+
 router.get("/", getJobs);
 
-router.get("/:id", getJobById);
+// Job-seeker facing analytics — two-segment paths, no ordering conflict
+// with "/:id" (different segment count), but grouped here for clarity.
+router.get("/:id/view", incrementJobView); // call when job detail page loads
+router.post("/:id/click", incrementJobClick); // call when "Apply" is clicked
 
+// Requires a logged-in jobseeker account (applications.applicant_id is a real FK)
+router.post("/:id/apply", requireAuth, applyToJob);
+
+// Business dashboard: single job's stats card + who applied
+router.get("/:id/stats", [requireAuth, requireBusinessAccount], getJobStats);
+router.get("/:id/applicants", [requireAuth, requireBusinessAccount], getJobApplicants);
+
+// Payment webhook callback — this should be called by your payment
+// provider's server-to-server webhook, not directly from the client.
+// If your webhook can't carry a business's auth token, swap requireAuth
+// out for your webhook-signature verification middleware instead.
+router.post("/:id/confirm-payment", confirmInformalJobPayment);
+
+// Generic "/:id" LAST among single-segment GETs — must come after "/mine",
+// "/informal", and "/pending" above.
+router.get("/:id", getJobById);
 
 // =============================
 // ADMIN ROUTES
 // =============================
-
-// CREATE JOB
+// CREATE JOB (formal / admin / scraped — goes live immediately, unlike
+// the business-facing "/informal" route above)
 router.post("/", adminCheck, createJob);
 
 // UPDATE JOB
@@ -36,5 +81,9 @@ router.delete("/:id", adminCheck, deleteJob);
 
 // TOGGLE FEATURED
 router.patch("/:id/featured", adminCheck, toggleFeaturedJob);
+
+// APPROVE / REJECT an informal job submission
+router.patch("/:id/approve", adminCheck, approveJob);
+router.patch("/:id/reject", adminCheck, rejectJob);
 
 export default router;

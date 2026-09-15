@@ -1,6 +1,8 @@
+// lib/supabaseAdmin.js
+// Server-side ONLY. Never import this file into frontend/client bundle code.
+// Client for the MAIN database (auth.users, profiles, recruiter_guests).
 import { createClient } from "@supabase/supabase-js";
 import dotenv from "dotenv";
-
 dotenv.config();
 
 export const supabase = createClient(
