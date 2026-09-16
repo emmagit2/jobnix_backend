@@ -26,11 +26,13 @@ function generateSlug(title, company, location, shortId) {
 const getFullJob = async (id) => {
   const { data: job, error } = await supabase
     .from("jobs")
-    .select("*, companies(id, name, logo_url)")
+    .select("*")
     .eq("id", id)
     .single();
 
   if (error || !job) return null;
+
+  const [withPoster] = await attachPosterInfo([job]);
 
   const { data: tags } = await supabase
     .from("requirements_tags")
@@ -43,12 +45,7 @@ const getFullJob = async (id) => {
       ? tags.map(t => ({ tag: t.tag, items: t.items }))
       : (job.requirements || []);
 
-  return {
-    ...job,
-    company_name: job.companies?.name || "",
-    company_logo: job.companies?.logo_url || "",
-    requirements,
-  };
+  return { ...withPoster, requirements };
 };
 
 // ─── Helper: fetch full job by SLUG or UUID ───────────────────────────────────
@@ -63,11 +60,13 @@ const getFullJobBySlugOrId = async (slugOrId) => {
 
   const { data: job, error } = await supabase
     .from("jobs")
-    .select("*, companies(id, name, logo_url)")
+    .select("*")
     .eq(isUUID ? "id" : "slug", slugOrId)
     .single();
 
   if (error || !job) return null;
+
+  const [withPoster] = await attachPosterInfo([job]);
 
   const { data: tags } = await supabase
     .from("requirements_tags")
@@ -80,14 +79,58 @@ const getFullJobBySlugOrId = async (slugOrId) => {
       ? tags.map(t => ({ tag: t.tag, items: t.items }))
       : (job.requirements || []);
 
-  return {
-    ...job,
-    company_name: job.companies?.name || "",
-    company_logo: job.companies?.logo_url || "",
-    requirements,
-  };
+  return { ...withPoster, requirements };
 };
 
+
+
+// same shape as getPendingJobs.
+const attachPosterInfo = async (jobs) => {
+  const formalIds = jobs
+    .filter(j => j.work_type !== "informal" && j.company_id)
+    .map(j => j.company_id);
+  const informalIds = jobs
+    .filter(j => j.work_type === "informal" && j.submitted_by_business_id)
+    .map(j => j.submitted_by_business_id);
+
+  let companiesById = {};
+  if (formalIds.length > 0) {
+    const { data } = await supabase
+      .from("companies")
+      .select("id, name, logo_url")
+      .in("id", [...new Set(formalIds)]);
+    companiesById = Object.fromEntries((data || []).map(c => [c.id, c]));
+  }
+
+  let businessesById = {};
+  if (informalIds.length > 0) {
+    const { data } = await supabase
+      .from("business_profiles")
+      // ✅ added business_type + address so the informal "Posted By" card
+      // on JobDetail.jsx has something to show beyond name/logo/phone.
+      .select("id, business_name, owner_name, logo_url, phone, phone_verified, nin_verified, business_type, address")
+      .in("id", [...new Set(informalIds)]);
+    businessesById = Object.fromEntries((data || []).map(b => [b.id, b]));
+  }
+
+  return jobs.map(job => {
+    if (job.work_type === "informal") {
+      const biz = businessesById[job.submitted_by_business_id];
+      return {
+        ...job,
+        company_name: biz?.business_name || biz?.owner_name || "Individual",
+        company_logo: biz?.logo_url || "",
+        poster: biz || null,
+      };
+    }
+    const co = companiesById[job.company_id];
+    return {
+      ...job,
+      company_name: co?.name || "",
+      company_logo: co?.logo_url || "",
+    };
+  });
+};
 // ─── Helper: sync requirements_tags rows for a job ───────────────────────────
 const syncRequirementsTags = async (jobId, requirements) => {
   await supabase.from("requirements_tags").delete().eq("job_id", jobId);
@@ -141,7 +184,7 @@ export const getJobs = async (req, res) => {
   try {
     const { data: jobs, error } = await supabase
       .from("jobs")
-      .select("*, companies(id, name, logo_url)")
+      .select("*")
       .eq("status", "approved")
       .order("created_date", { ascending: false });
 
@@ -161,10 +204,10 @@ export const getJobs = async (req, res) => {
       tagsByJob[t.job_id].push({ tag: t.tag, items: t.items });
     });
 
-    const result = jobs.map(job => ({
+    const withPoster = await attachPosterInfo(jobs);
+
+    const result = withPoster.map(job => ({
       ...job,
-      company_name: job.companies?.name || "",
-      company_logo: job.companies?.logo_url || "",
       requirements: tagsByJob[job.id]?.length > 0
         ? tagsByJob[job.id]
         : (job.requirements || []),
@@ -526,7 +569,7 @@ export const applyToJob = async (req, res) => {
   }
 };
 
- 
+
 
 // ─── JOB STATS (business dashboard): one job's view/click/application card ───
 export const getJobStats = async (req, res) => {
@@ -713,18 +756,34 @@ export const confirmInformalJobPayment = async (req, res) => {
 };
 
 // ─── ADMIN: LIST PENDING INFORMAL JOBS ───────────────────────────────────────
-// Only shows jobs that are paid AND pending — no point reviewing something
-// that hasn't been paid for yet.
 export const getPendingJobs = async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data: jobs, error } = await supabase
       .from("jobs")
       .select("*")
       .eq("work_type", "informal")
       .eq("status", "pending")
       .eq("payment_status", "paid")
       .order("created_date", { ascending: true });
+
     if (error) throw error;
+
+    const businessIds = [...new Set(jobs.map(j => j.submitted_by_business_id).filter(Boolean))];
+    let posterById = {};
+    if (businessIds.length > 0) {
+      const { data: businesses, error: bizErr } = await supabase
+        .from("business_profiles")
+        .select("id, business_name, owner_name, phone, phone_verified, nin_verified, logo_url")
+        .in("id", businessIds);
+      if (bizErr) throw bizErr;
+      posterById = Object.fromEntries(businesses.map(b => [b.id, b]));
+    }
+
+    const data = jobs.map(job => ({
+      ...job,
+      poster: posterById[job.submitted_by_business_id] || null,
+    }));
+
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -736,8 +795,13 @@ export const approveJob = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { data: job, error: fetchErr } = await supabase.from("jobs").select("payment_status").eq("id", id).single();
+    const { data: job, error: fetchErr } = await supabase
+      .from("jobs")
+      .select("title, payment_status, submitted_by_business_id")
+      .eq("id", id)
+      .single();
     if (fetchErr) throw fetchErr;
+
     if (job.payment_status !== "paid") {
       return res.status(400).json({ success: false, message: "Cannot approve a job that hasn't been paid for" });
     }
@@ -746,13 +810,24 @@ export const approveJob = async (req, res) => {
       .from("jobs")
       .update({
         status: "approved",
-        approved_by: req.userId, // the admin's id, from your auth middleware
+        approved_by: req.userId,
         approved_at: new Date().toISOString(),
       })
       .eq("id", id)
       .select()
       .single();
     if (error) throw error;
+
+    // Notifications not wired up yet — don't let a missing/broken notifier
+    // block the actual approval. Remove this try/catch once
+    // notifyJobApproved is implemented and tested.
+    if (job.submitted_by_business_id && typeof notificationService.notifyJobApproved === "function") {
+      try {
+        await notificationService.notifyJobApproved(job.submitted_by_business_id, job.title);
+      } catch (notifyErr) {
+        console.error("notifyJobApproved failed (non-fatal):", notifyErr.message);
+      }
+    }
 
     res.json({ success: true, data, message: "Job approved and now live" });
   } catch (err) {
@@ -766,6 +841,13 @@ export const rejectJob = async (req, res) => {
     const { id } = req.params;
     const { reason } = req.body;
 
+    const { data: job, error: fetchErr } = await supabase
+      .from("jobs")
+      .select("title, submitted_by_business_id")
+      .eq("id", id)
+      .single();
+    if (fetchErr) throw fetchErr;
+
     const { data, error } = await supabase
       .from("jobs")
       .update({ status: "rejected", rejection_reason: reason || null })
@@ -774,16 +856,20 @@ export const rejectJob = async (req, res) => {
       .single();
     if (error) throw error;
 
+    if (job.submitted_by_business_id && typeof notificationService.notifyJobRejected === "function") {
+      try {
+        await notificationService.notifyJobRejected(job.submitted_by_business_id, job.title, reason || null);
+      } catch (notifyErr) {
+        console.error("notifyJobRejected failed (non-fatal):", notifyErr.message);
+      }
+    }
+
     res.json({ success: true, data, message: "Job rejected" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-// ─── MY JOBS (business dashboard): jobs I own, whether formal (matched by
-// recruiter_email) or informal (matched by submitted_by_business_id) ───────
-// Informal jobs have recruiter_email as null (see submitInformalJob), so
-// matching on recruiter_email alone — the original version of this
-// function — silently excluded every informal job a business ever posted.
+
 export const getMyJobs = async (req, res) => {
   try {
     const { data: me, error: meErr } = await supabase.from("profiles").select("email").eq("id", req.businessId).single();
@@ -801,3 +887,8 @@ export const getMyJobs = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+// export const notifyJobApproved = async (businessId, jobTitle) => {
+// };
+
+// export const notifyJobRejected = async (businessId, jobTitle, reason) => {
+// };
