@@ -2,9 +2,6 @@ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION — full detail:");
   console.error(reason);
 });
- 
-
-
 
 import express from "express";
 import cors from "cors";
@@ -26,7 +23,7 @@ import recruiterHubRoutes from "./route/recruiterHub.js"; // one dashboard — e
 import userMessagesRoutes from "./route/userMessages.js";
 import emailsRouter from "./route/emails.routes.js";
 import { supabase } from "./config/supabase.js";
-  
+
 import whatsappRoutes from "./route/whatsapp.js";
 import paymentRoutes from "./route/paymentRoutes.js";
 import accountRoutes from "./route/accountRoutes.js";
@@ -67,6 +64,15 @@ app.use(
 );
 app.use(cookieParser());
 
+// ── Public guest messaging — MUST be mounted before "/api/messages" ─────
+// userMessagesRoutes runs `router.use(requireAuth)`, so it rejects any
+// unauthenticated request under /api/messages with a 401 before Express can
+// reach a router mounted after it. guestMessagesRoutes defines its own full
+// paths (/api/messages/guest-send, /api/messages/guest/:token, ...) and is
+// deliberately public (guests have no login), so it has to be registered
+// first or guest send/reply can never work.
+app.use(guestMessagesRoutes);
+
 // ── More specific mounts first ───────────────────────────────────────────
 // Several routers below are mounted at the broad "/api" path rather than a
 // specific sub-path. Express matches middleware strictly in registration
@@ -88,7 +94,7 @@ app.use("/api/jobs", jobRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/companies", companyRoutes);
 app.use("/api/roles", rolesRoutes);
-app.use("/api/messages", userMessagesRoutes);
+app.use("/api/messages", userMessagesRoutes); // requireAuth on everything under here
 app.use("/api/emails", emailsRouter);
 
 // ── Existing production route mounts (broader "/api" paths — kept last so
@@ -96,7 +102,6 @@ app.use("/api/emails", emailsRouter);
 app.use(backfillUsersRouter);
 app.use("/api", applicationsRoutes);
 app.use("/api", profileViewRoutes);
-app.use(guestMessagesRoutes);
 app.use(syncUserRoutes);
 app.use("/api", recruiterHubRoutes);
 

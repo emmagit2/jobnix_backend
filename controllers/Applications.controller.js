@@ -36,16 +36,19 @@ import {
 } from "../lib/emailTemplates.js";
 import * as notificationService from "../services/notificationService.js";
 
+// ➕ NEW: in-app messaging (DB2) for informal-job applications
+import { findOrCreateConversation } from "../lib/conversations.js";
+import messagingAdminDB from "../lib/messagingAdminDB.js";
+
 // =============================
 // POST /applications
 // One-click ("platform") or logging an ("email") apply.
+//
+// Informal jobs: requires the applicant's current location, saves it on the
+// application row, then opens an in-app conversation with the poster and
+// drops an "applied" message into it, so the business sees the applicant in
+// their inbox right away. Formal jobs are unchanged.
 // =============================
- // BACKEND: controllers/applications.controller.js
-// Replace your whole existing `createApplication` with this one.
-// Only the informal branch changed: it now requires a current location and
-// saves it (label + optional coordinates) on the application row.
-// Everything else (formal jobs, confirmation email) is exactly as before.
-
 export const createApplication = async (req, res) => {
   const applicantId = req.user.id;
   const {
@@ -60,7 +63,6 @@ export const createApplication = async (req, res) => {
     return res.status(400).json({ message: "method must be 'platform' or 'email'" });
   }
 
-  // ─────────────── INFORMAL JOBS (always one-click) ───────────────
   const { data: job } = await supabase
     .from("jobs")
     .select("id, title, work_type, status, submitted_by_business_id")
@@ -69,6 +71,7 @@ export const createApplication = async (req, res) => {
 
   if (!job) return res.status(404).json({ message: "Job not found" });
 
+  // ─────────────── INFORMAL JOBS (always one-click) ───────────────
   if (job.work_type === "informal") {
     if (job.status !== "approved") {
       return res.status(400).json({ message: "This job isn't open for applications." });
@@ -97,10 +100,6 @@ export const createApplication = async (req, res) => {
       return res.status(400).json({ message: "Please share your current location to apply." });
     }
 
-    // Applicant name for the poster's notification
-    const { data: profile } = await supabase
-      .from("user_profiles").select("full_name").eq("id", applicantId).maybeSingle();
-
     const { data: row, error: insErr } = await supabase
       .from("applications")
       .insert({
@@ -115,16 +114,37 @@ export const createApplication = async (req, res) => {
       .select().single();
     if (insErr) return res.status(500).json({ message: insErr.message });
 
-    // Non-fatal: counter + notify the poster
+    // Non-fatal: the application is already saved above, so a failure here
+    // must not turn a successful apply into an error for the applicant.
+    // counter + conversation + first message + notify the poster
     try {
       await supabase.rpc("increment_job_application", { p_job_id: job.id });
+
+      const { conversationId, applicantName } = await findOrCreateConversation({
+        businessId: job.submitted_by_business_id,
+        applicantId,
+        jobId: job.id,
+      });
+
+      const { error: msgErr } = await messagingAdminDB.from("messages").insert({
+        conversation_id: conversationId,
+        sender_id: applicantId,
+        content:
+          `${applicantName} applied for "${job.title}"` +
+          (locationLabel ? ` — currently in ${locationLabel}.` : "."),
+      });
+      if (msgErr) throw msgErr;
+      // last_message_at is bumped by the trg_bump_conversation_last_message
+      // trigger in DB2 — make sure that trigger exists, otherwise update
+      // conversations.last_message_at here yourself.
+
       await notificationService.notifyNewApplicant(
         job.submitted_by_business_id,
         job.title,
-        profile?.full_name || "A candidate"
+        applicantName
       );
     } catch (e) {
-      console.error("Post-apply counter/notify failed:", e.message);
+      console.error("Post-apply counter/chat/notify failed:", e.message);
     }
 
     return res.status(201).json({ data: row });
@@ -174,6 +194,7 @@ export const createApplication = async (req, res) => {
 
   return res.status(201).json({ data });
 };
+
 // =============================
 // GET /applications/job/:jobId
 // The signed-in user's own application for one job — powers the
@@ -199,9 +220,9 @@ export const getApplicationForJob = async (req, res) => {
 // GET /applications/me
 // All of the signed-in user's applications, with job details joined in —
 // powers the "My Applications" page.
-// ✅ UPDATED: now also pulls work_type (for the Corporate/Informal split)
-// and the job's company name + logo_url, so the frontend can render the
-// company logo instead of falling back to an initial letter.
+// Also pulls work_type (for the Corporate/Informal split) and the job's
+// company name + logo_url, so the frontend can render the company logo
+// instead of falling back to an initial letter.
 // =============================
 export const getMyApplications = async (req, res) => {
   const applicantId = req.user.id;
@@ -275,7 +296,7 @@ export const getApplicationsForJobAdmin = async (req, res) => {
 // back the full URL to copy/send to the employer.
 // Protected by adminCheck — no role check needed here.
 // =============================
-// ✅ The admin dashboard can be hit from localhost during development or
+// The admin dashboard can be hit from localhost during development or
 // from the real jobnix.ng domain in production — the recruiter link should
 // match whichever one the admin is actually using, not always the same
 // hardcoded env var. Only known origins are allowed here (not just anything
@@ -332,7 +353,7 @@ export const getOrCreateRecruiterLink = async (req, res) => {
 
   const url = `${linkOrigin}/recruiter-view/${token}`;
 
-  // ✅ Auto-email the link to the recruiter every time the admin clicks
+  // Auto-email the link to the recruiter every time the admin clicks
   // "Get recruiter link" — whether it's brand new or already existed, this
   // doubles as a "resend" so the admin doesn't have to copy/paste manually.
   try {

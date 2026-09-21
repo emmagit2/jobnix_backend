@@ -2,6 +2,8 @@ import { supabase } from "../config/supabase.js";
 import messagingAdminDB from "../lib/messagingAdminDB.js";
 import * as notificationService from "../services/notificationService.js";
 import { PLANS } from "../config/plans.js";
+import { findOrCreateConversation } from "../lib/conversations.js";
+
 
 const INFORMAL_JOB_FEE = 1500; // NGN — flat fee to publish an informal job advert
 
@@ -491,16 +493,17 @@ export const incrementJobClick = async (req, res) => {
   }
 };
 
+
 // ─── APPLY (requires a logged-in jobseeker — req.userId from requireAuth) ────
 export const applyToJob = async (req, res) => {
   try {
     const { coverNote } = req.body;
     const { id: jobId } = req.params;
-
+ 
     const { data: job, error: jobErr } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
     if (jobErr) throw jobErr;
     if (!job) return res.status(404).json({ success: false, message: "Job not found" });
-
+ 
     const { data: already } = await supabase
       .from("applications")
       .select("id")
@@ -508,72 +511,51 @@ export const applyToJob = async (req, res) => {
       .eq("applicant_id", req.userId)
       .maybeSingle();
     if (already) return res.status(409).json({ success: false, message: "You've already applied to this job" });
-
+ 
     const { data: application, error: appErr } = await supabase
       .from("applications")
       .insert({ job_id: jobId, applicant_id: req.userId, cover_note: coverNote })
       .select()
       .single();
     if (appErr) throw appErr;
-
+ 
     await supabase.rpc("increment_job_application", { p_job_id: jobId });
-
-    const businessId = await resolveBusinessIdForJob(job);
-    if (businessId) {
-      const { data: applicantProfile } = await supabase
-        .from("user_profiles")
-        .select("full_name")
-        .eq("id", req.userId)
-        .maybeSingle();
-      const applicantName = applicantProfile?.full_name || "A candidate";
-
-      // Find-or-create the conversation, same pattern as
-      // userMessages.controller.js's startConversation — checks both
-      // participant orderings, then tags job_id since this one's
-      // job-specific (startConversation itself doesn't set job_id).
-      const { data: existingConvo } = await messagingAdminDB
-        .from("conversations")
-        .select("id, job_id")
-        .or(
-          `and(participant_one.eq.${businessId},participant_two.eq.${req.userId}),` +
-            `and(participant_one.eq.${req.userId},participant_two.eq.${businessId})`
-        )
-        .maybeSingle();
-
-      let conversationId = existingConvo?.id;
-      if (!conversationId) {
-        const { data: created, error: convoErr } = await messagingAdminDB
-          .from("conversations")
-          .insert({ participant_one: businessId, participant_two: req.userId, job_id: job.id })
-          .select("id")
-          .single();
-        if (convoErr) throw convoErr;
-        conversationId = created.id;
-      } else if (!existingConvo.job_id) {
-        // Conversation existed from before this application (e.g. they'd
-        // already messaged) but wasn't tagged to a job yet — tag it now.
-        await messagingAdminDB.from("conversations").update({ job_id: job.id }).eq("id", conversationId);
+ 
+    // Non-fatal: the application is already saved, so a messaging/notification
+    // problem must not make the applicant see an error.
+    try {
+      const businessId = await resolveBusinessIdForJob(job);
+      // businessId null = job posted by a guest recruiter with no account yet — nothing to notify
+      if (businessId) {
+        // Syncs both users into DB2, then finds or creates the conversation
+        // and tags it with this job.
+        const { conversationId, applicantName } = await findOrCreateConversation({
+          businessId,
+          applicantId: req.userId,
+          jobId: job.id,
+        });
+ 
+        const { error: msgErr } = await messagingAdminDB.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: req.userId,
+          content: coverNote?.trim() || `${applicantName} applied to "${job.title}".`,
+        });
+        if (msgErr) throw msgErr;
+        // last_message_at is kept current by your existing
+        // trg_bump_conversation_last_message trigger — no manual update needed.
+ 
+        await notificationService.notifyNewApplicant(businessId, job.title, applicantName);
       }
-
-      const { error: msgErr } = await messagingAdminDB.from("messages").insert({
-        conversation_id: conversationId,
-        sender_id: req.userId,
-        content: coverNote?.trim() || `${applicantName} applied to "${job.title}".`,
-      });
-      if (msgErr) throw msgErr;
-      // last_message_at is kept current by your existing
-      // trg_bump_conversation_last_message trigger — no manual update needed.
-
-      await notificationService.notifyNewApplicant(businessId, job.title, applicantName);
+    } catch (chatErr) {
+      console.error("applyToJob: post-apply chat/notify failed:", chatErr.message);
     }
-    // businessId null = job posted by a guest recruiter with no account yet — nothing to notify
-
+ 
     res.status(201).json({ success: true, data: application });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
+ 
 
 
 // ─── JOB STATS (business dashboard): one job's view/click/application card ───
@@ -1060,7 +1042,6 @@ export const openApplicantChat = async (req, res) => {
     const { applicationId } = req.params;
     const businessId = req.businessId;
 
-    // Only the poster of an informal job can open a chat from its applications
     const { data: app, error } = await supabase
       .from("applications")
       .select("id, applicant_id, job_id, jobs ( id, work_type, submitted_by_business_id )")
@@ -1072,40 +1053,16 @@ export const openApplicantChat = async (req, res) => {
       return res.status(404).json({ success: false, message: "Application not found" });
     }
 
-    const applicantId = app.applicant_id;
+    const { conversationId } = await findOrCreateConversation({
+      businessId, applicantId: app.applicant_id, jobId: app.job_id,
+    });
 
-    // Find an existing conversation between these two people (either order)
-    const { data: existing, error: findErr } = await messagingAdminDB
-      .from("conversations")
-      .select("id, job_id")
-      .or(
-        `and(participant_one.eq.${businessId},participant_two.eq.${applicantId}),` +
-          `and(participant_one.eq.${applicantId},participant_two.eq.${businessId})`
-      )
-      .maybeSingle();
-    if (findErr) throw findErr;
-
-    let conversationId = existing?.id;
-
-    if (!conversationId) {
-      const { data: created, error: createErr } = await messagingAdminDB
-        .from("conversations")
-        .insert({ participant_one: businessId, participant_two: applicantId, job_id: app.job_id })
-        .select("id")
-        .single();
-      if (createErr) throw createErr;
-      conversationId = created.id;
-    } else if (!existing.job_id) {
-      // Conversation existed before but wasn't tied to a job yet
-      await messagingAdminDB.from("conversations").update({ job_id: app.job_id }).eq("id", conversationId);
-    }
-
-    res.json({ success: true, data: { conversation_id: conversationId, applicant_id: applicantId } });
+    res.json({ success: true, data: { conversation_id: conversationId, applicant_id: app.applicant_id } });
   } catch (err) {
+    console.error("openApplicantChat failed:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
 // export const notifyJobApproved = async (businessId, jobTitle) => {
 // };
 
