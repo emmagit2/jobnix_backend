@@ -34,14 +34,24 @@ import {
   recruiterAccessCodeEmail,
   applicationConfirmationEmail,
 } from "../lib/emailTemplates.js";
+import * as notificationService from "../services/notificationService.js";
 
 // =============================
 // POST /applications
 // One-click ("platform") or logging an ("email") apply.
 // =============================
+ // BACKEND: controllers/applications.controller.js
+// Replace your whole existing `createApplication` with this one.
+// Only the informal branch changed: it now requires a current location and
+// saves it (label + optional coordinates) on the application row.
+// Everything else (formal jobs, confirmation email) is exactly as before.
+
 export const createApplication = async (req, res) => {
   const applicantId = req.user.id;
-  const { job_id, method, email_sent_to, email_body } = req.body;
+  const {
+    job_id, method, email_sent_to, email_body,
+    applicant_location, applicant_lat, applicant_lng,
+  } = req.body;
 
   if (!job_id || !method) {
     return res.status(400).json({ message: "job_id and method are required" });
@@ -50,8 +60,78 @@ export const createApplication = async (req, res) => {
     return res.status(400).json({ message: "method must be 'platform' or 'email'" });
   }
 
-  // Upsert so re-clicking Apply (or re-sending the email) updates the
-  // existing row instead of hitting the unique (job_id, applicant_id) constraint.
+  // ─────────────── INFORMAL JOBS (always one-click) ───────────────
+  const { data: job } = await supabase
+    .from("jobs")
+    .select("id, title, work_type, status, submitted_by_business_id")
+    .eq("id", job_id)
+    .maybeSingle();
+
+  if (!job) return res.status(404).json({ message: "Job not found" });
+
+  if (job.work_type === "informal") {
+    if (job.status !== "approved") {
+      return res.status(400).json({ message: "This job isn't open for applications." });
+    }
+    if (job.submitted_by_business_id === applicantId) {
+      return res.status(400).json({ message: "You can't apply to your own job." });
+    }
+
+    // Already applied? Return it as is (don't reset accepted/rejected)
+    const { data: existing } = await supabase
+      .from("applications").select("*")
+      .eq("job_id", job_id).eq("applicant_id", applicantId).maybeSingle();
+    if (existing) return res.status(200).json({ data: existing });
+
+    // ── Current location (captured in the Jobnix Direct popup) ──
+    const locationLabel =
+      typeof applicant_location === "string" ? applicant_location.trim().slice(0, 200) : "";
+
+    // typeof check on purpose: Number(null) === 0 would save a fake location
+    const hasCoords =
+      typeof applicant_lat === "number" && typeof applicant_lng === "number" &&
+      Number.isFinite(applicant_lat) && Number.isFinite(applicant_lng) &&
+      Math.abs(applicant_lat) <= 90 && Math.abs(applicant_lng) <= 180;
+
+    if (!locationLabel && !hasCoords) {
+      return res.status(400).json({ message: "Please share your current location to apply." });
+    }
+
+    // Applicant name for the poster's notification
+    const { data: profile } = await supabase
+      .from("user_profiles").select("full_name").eq("id", applicantId).maybeSingle();
+
+    const { data: row, error: insErr } = await supabase
+      .from("applications")
+      .insert({
+        job_id,
+        applicant_id: applicantId,
+        method: "platform",
+        status: "applied",
+        applicant_location: locationLabel || null,
+        applicant_lat: hasCoords ? applicant_lat : null,
+        applicant_lng: hasCoords ? applicant_lng : null,
+      })
+      .select().single();
+    if (insErr) return res.status(500).json({ message: insErr.message });
+
+    // Non-fatal: counter + notify the poster
+    try {
+      await supabase.rpc("increment_job_application", { p_job_id: job.id });
+      await notificationService.notifyNewApplicant(
+        job.submitted_by_business_id,
+        job.title,
+        profile?.full_name || "A candidate"
+      );
+    } catch (e) {
+      console.error("Post-apply counter/notify failed:", e.message);
+    }
+
+    return res.status(201).json({ data: row });
+  }
+
+  // ─────────────── FORMAL JOBS: unchanged ───────────────
+
   const { data, error } = await supabase
     .from("applications")
     .upsert(
@@ -71,9 +151,6 @@ export const createApplication = async (req, res) => {
 
   if (error) return res.status(500).json({ message: error.message });
 
-  // ✅ Fire-and-forget confirmation email to the applicant — applying
-  // should succeed for the user even if Resend is slow/down, so this is
-  // never awaited and never allowed to throw back into the response.
   (async () => {
     try {
       const { data: job } = await supabase
@@ -97,7 +174,6 @@ export const createApplication = async (req, res) => {
 
   return res.status(201).json({ data });
 };
-
 // =============================
 // GET /applications/job/:jobId
 // The signed-in user's own application for one job — powers the

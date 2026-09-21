@@ -5,6 +5,11 @@ import { PLANS } from "../config/plans.js";
 
 const INFORMAL_JOB_FEE = 1500; // NGN — flat fee to publish an informal job advert
 
+// Table that holds each user's skills. Its "trade" column (jsonb) is a list like
+// [{ trade, organisation, location, serviceArea, yearsExperience }] and is the
+// ONLY skills info shown on the applicant card for informal jobs.
+const SKILLS_TABLE = "user_skills";
+
 /* ─── Slug generator (no extra package needed) ───────────────────── */
 function generateSlug(title, company, location, shortId) {
   const parts = [title, company ? `at-${company}` : null, location]
@@ -667,8 +672,7 @@ export const submitInformalJob = async (req, res) => {
     const {
       title, location, role_category, description, responsibilities, benefits,
       salary_min, salary_max, salary_currency,
-      apply_method, apply_link, apply_email, how_to_apply, deadline,
-      recruiter_email,
+      deadline,
       postAs, // 'owner' | 'agent'
       agent_name, agent_phone, // only meaningful when postAs === 'agent'
     } = req.body;
@@ -696,9 +700,15 @@ export const submitInformalJob = async (req, res) => {
         responsibilities: responsibilities || [],
         benefits: benefits || [],
         salary_min, salary_max, salary_currency,
-        apply_method: apply_method || "instructions",
-        apply_link, apply_email, how_to_apply, deadline,
-        recruiter_email: apply_method === "platform" ? recruiter_email : null,
+
+        // Informal jobs are always one-click. These are set here on the
+        // server so the client can't send anything else.
+        apply_method: "platform",
+        apply_link: null,
+        apply_email: null,
+        how_to_apply: null,
+        recruiter_email: null,
+        deadline,
         slug,
 
         // Approval — pending until admin reviews
@@ -887,6 +897,215 @@ export const getMyJobs = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Business dashboard: applicants to MY informal jobs
+// (powers Applicants.jsx — list, accept/reject, and open an in-app chat)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// jsonb columns come back already parsed, but if a column is plain text this
+// turns it into real data instead of crashing.
+const parseJsonValue = (v, fallback) => {
+  if (v == null) return fallback;
+  if (typeof v === "string") {
+    try { return JSON.parse(v); } catch { return fallback; }
+  }
+  return v;
+};
+
+const cleanText = (v) => (v == null ? "" : String(v).trim());
+
+// user_skills.trade (jsonb) -> [{ trade, organisation, location, service_area, years }]
+// This is the only skills info sent for informal applicants.
+const toTradeList = (raw) => {
+  const list = parseJsonValue(raw, []);
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((t) => ({
+      trade: cleanText(t?.trade),
+      organisation: cleanText(t?.organisation),
+      location: cleanText(t?.location),
+      service_area: cleanText(t?.serviceArea),
+      years: Number(t?.yearsExperience) || 0,
+    }))
+    .filter((t) => t.trade);
+};
+
+// ─── All applicants across MY informal jobs ──────────────────────────────────
+// Returns the job (title, location), when they applied, where they said they
+// were when they applied, their work status, and their trade (from
+// user_skills.trade). Phone, email, CV, headline, roles and the technical /
+// soft skill lists are deliberately NOT sent, so businesses reach applicants
+// through in-app Messages only.
+export const getMyInformalApplicants = async (req, res) => {
+  try {
+    const { data: jobs, error: jobsErr } = await supabase
+      .from("jobs")
+      .select("id, title, location, role_category")
+      .eq("work_type", "informal")
+      .eq("submitted_by_business_id", req.businessId);
+    if (jobsErr) throw jobsErr;
+    if (!jobs.length) return res.json({ success: true, data: [] });
+
+    const jobById = Object.fromEntries(jobs.map((j) => [j.id, j]));
+
+    // Also reads the location the applicant shared in the
+    // "Where are you right now?" popup
+    const { data: apps, error: appsErr } = await supabase
+      .from("applications")
+      .select("id, job_id, applicant_id, status, applied_at, applicant_location, applicant_lat, applicant_lng")
+      .in("job_id", jobs.map((j) => j.id))
+      .order("applied_at", { ascending: false });
+    if (appsErr) throw appsErr;
+
+    const ids = [...new Set(apps.map((a) => a.applicant_id))];
+    let byId = {};
+    let skillsByUser = {};
+
+    if (ids.length) {
+      const { data: profiles, error: profErr } = await supabase
+        .from("user_profiles")
+        .select("id, full_name, avatar_url, location, job_locations, employment_status")
+        .in("id", ids);
+      if (profErr) throw profErr;
+      byId = Object.fromEntries(profiles.map((p) => [p.id, p]));
+
+      // Only the "trade" column. Non-fatal: if this lookup fails, the page
+      // still works, just without the trade section.
+      const { data: skillRows, error: skillErr } = await supabase
+        .from(SKILLS_TABLE)
+        .select("user_id, trade")
+        .in("user_id", ids);
+      if (skillErr) {
+        console.error(`Skills lookup failed (check SKILLS_TABLE = "${SKILLS_TABLE}"):`, skillErr.message);
+      } else {
+        skillsByUser = Object.fromEntries((skillRows || []).map((r) => [r.user_id, r]));
+      }
+    }
+
+    const data = apps.map((a) => {
+      const p = byId[a.applicant_id];
+      const job = jobById[a.job_id];
+      const skills = skillsByUser[a.applicant_id];
+      return {
+        id: a.id,
+        status: a.status === "applied" ? "pending" : a.status,
+        applied_at: a.applied_at,
+
+        // the job they applied for
+        job_id: a.job_id,
+        job_title: job?.title || "",
+        job_location: job?.location || "",
+        job_category: job?.role_category || "",
+
+        // where the applicant said they were when they applied
+        current_location: a.applicant_location || null,
+        current_lat: a.applicant_lat ?? null,
+        current_lng: a.applicant_lng ?? null,
+
+        // the applicant (no contact details, no headline, no roles)
+        applicant_id: a.applicant_id,
+        applicant_name: p?.full_name || "Applicant",
+        applicant_avatar: p?.avatar_url || null,
+        applicant_location: p?.location || null, // where they LIVE (profile)
+        job_locations: p?.job_locations || [],   // "Can work in"
+        employment_status: p?.employment_status || null, // looking / full_time / part_time
+
+        // from user_skills.trade
+        trades: toTradeList(skills?.trade),
+      };
+    });
+
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── Accept / reject / reset one applicant ───────────────────────────────────
+export const updateApplicantStatus = async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const dbStatus = { pending: "applied", accepted: "accepted", rejected: "rejected" }[req.body.status];
+    if (!dbStatus) {
+      return res.status(400).json({ success: false, message: "status must be pending, accepted or rejected" });
+    }
+
+    const { data: app, error } = await supabase
+      .from("applications")
+      .select("id, jobs ( work_type, submitted_by_business_id )")
+      .eq("id", applicationId)
+      .maybeSingle();
+    if (error) throw error;
+
+    // 404 rather than 403 so we don't reveal that the application exists
+    if (!app || app.jobs?.work_type !== "informal" || app.jobs.submitted_by_business_id !== req.businessId) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+
+    const { error: updErr } = await supabase.from("applications").update({ status: dbStatus }).eq("id", applicationId);
+    if (updErr) throw updErr;
+
+    res.json({ success: true, data: { id: applicationId, status: req.body.status } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── Open (or create) the in-app chat with one applicant ─────────────────────
+// Same conversation pattern applyToJob uses: one conversation per pair of
+// people, tagged with the job it started from.
+export const openApplicantChat = async (req, res) => {
+  try {
+    const { applicationId } = req.params;
+    const businessId = req.businessId;
+
+    // Only the poster of an informal job can open a chat from its applications
+    const { data: app, error } = await supabase
+      .from("applications")
+      .select("id, applicant_id, job_id, jobs ( id, work_type, submitted_by_business_id )")
+      .eq("id", applicationId)
+      .maybeSingle();
+    if (error) throw error;
+
+    if (!app || app.jobs?.work_type !== "informal" || app.jobs.submitted_by_business_id !== businessId) {
+      return res.status(404).json({ success: false, message: "Application not found" });
+    }
+
+    const applicantId = app.applicant_id;
+
+    // Find an existing conversation between these two people (either order)
+    const { data: existing, error: findErr } = await messagingAdminDB
+      .from("conversations")
+      .select("id, job_id")
+      .or(
+        `and(participant_one.eq.${businessId},participant_two.eq.${applicantId}),` +
+          `and(participant_one.eq.${applicantId},participant_two.eq.${businessId})`
+      )
+      .maybeSingle();
+    if (findErr) throw findErr;
+
+    let conversationId = existing?.id;
+
+    if (!conversationId) {
+      const { data: created, error: createErr } = await messagingAdminDB
+        .from("conversations")
+        .insert({ participant_one: businessId, participant_two: applicantId, job_id: app.job_id })
+        .select("id")
+        .single();
+      if (createErr) throw createErr;
+      conversationId = created.id;
+    } else if (!existing.job_id) {
+      // Conversation existed before but wasn't tied to a job yet
+      await messagingAdminDB.from("conversations").update({ job_id: app.job_id }).eq("id", conversationId);
+    }
+
+    res.json({ success: true, data: { conversation_id: conversationId, applicant_id: applicantId } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // export const notifyJobApproved = async (businessId, jobTitle) => {
 // };
 

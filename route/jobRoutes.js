@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import {
   getJobs,
   getJobById,
@@ -17,6 +17,9 @@ import {
   getPendingJobs,
   approveJob,
   rejectJob,
+  getMyInformalApplicants,
+  updateApplicantStatus,
+  openApplicantChat,
 } from "../controllers/jobController.js";
 import adminCheck from "../middleware/adminCheck.js";
 import requireAuth from "../middleware/requireAuth.js";
@@ -27,12 +30,18 @@ const router = express.Router();
 // =============================
 // PUBLIC / BUSINESS ROUTES
 // =============================
-// Single-segment paths ("/mine", "/informal", "/pending") MUST all be
-// registered before the generic "/:id" below — otherwise Express matches
-// them as GET/POST /:id with id="mine"/"informal"/"pending" and the real
+// Single-segment paths ("/mine", "/applicants", "/informal", "/pending") MUST
+// all be registered before the generic "/:id" below — otherwise Express
+// matches them as GET/POST /:id with id="mine"/"applicants"/... and the real
 // handler never runs.
 
 router.get("/mine", [requireAuth, requireBusinessAccount], getMyJobs);
+
+// Business dashboard: every applicant across MY informal jobs, accept/reject
+// one of them, and open an in-app chat with them.
+router.get("/applicants", [requireAuth, requireBusinessAccount], getMyInformalApplicants);
+router.patch("/applicants/:applicationId/status", [requireAuth, requireBusinessAccount], updateApplicantStatus);
+router.post("/applicants/:applicationId/chat", [requireAuth, requireBusinessAccount], openApplicantChat);
 
 // Business (or agent acting for a business) submits an informal job —
 // always lands as status "pending" + payment_status "pending". Never goes
@@ -63,7 +72,7 @@ router.get("/:id/applicants", [requireAuth, requireBusinessAccount], getJobAppli
 router.post("/:id/confirm-payment", confirmInformalJobPayment);
 
 // Generic "/:id" LAST among single-segment GETs — must come after "/mine",
-// "/informal", and "/pending" above.
+// "/applicants", "/informal", and "/pending" above.
 router.get("/:id", getJobById);
 
 // =============================
