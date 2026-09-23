@@ -28,6 +28,19 @@ import messagingAdminDB from "../lib/messagingAdminDB.js";
 import { supabase } from "../config/supabase.js";
 import * as notificationService from "../services/notificationService.js";
 
+// Fire-and-forget wrapper for the WhatsApp notification. This must NEVER be
+// awaited before res.json() — if the underlying WhatsApp/API call hangs or
+// is slow, awaiting it here would hang the whole HTTP response, which is
+// exactly what was making the frontend's "send" spinner spin forever even
+// though the message had already saved successfully.
+function notifyNewMessageInBackground(recipientId, senderName, jobTitle) {
+  notificationService
+    .notifyNewMessage(recipientId, senderName, jobTitle)
+    .catch((err) => {
+      console.error("[notifyNewMessage] failed (non-fatal):", err?.message || err);
+    });
+}
+
 // =============================
 // GET /messages/conversations
 // List every conversation the logged-in user is part of.
@@ -50,11 +63,21 @@ export const listConversations = async (req, res) => {
 
   if (error) return res.status(500).json({ message: error.message });
 
-  const conversations = data.map((c) => ({
-    id: c.id,
-    last_message_at: c.last_message_at,
-    otherUser: c.participant_one === userId ? c.p2 : c.p1,
-  }));
+  // ✅ Sent as "other_user" (snake_case) — this is the exact key
+  // Messages.jsx's normalizeConversation looks for. It was previously sent
+  // as "otherUser" (camelCase), which normalizeConversation never matched,
+  // so every conversation fell through to its "Applicant" fallback name.
+  const conversations = data.map((c) => {
+    const other = c.participant_one === userId ? c.p2 : c.p1;
+    return {
+      id: c.id,
+      last_message_at: c.last_message_at,
+      other_user: other,
+      // also included flat, in case anything else reads these directly
+      other_name: other?.display_name || null,
+      other_avatar: other?.avatar_url || null,
+    };
+  });
 
   return res.json({ data: conversations });
 };
@@ -127,12 +150,6 @@ export const reply = async (req, res) => {
     .single();
   if (msgErr) return res.status(500).json({ message: msgErr.message });
 
-  // Was previously fire-and-forget with no error check — if this silently
-  // failed (bad id cast, RLS, etc.) the inbox would show a stale
-  // last_message_at even after a hard refresh, with no error surfaced
-  // anywhere. Now we check it and log loudly if it fails, since the
-  // message itself already sent successfully and we don't want to fail
-  // the whole request over a secondary write.
   const { error: touchErr } = await messagingAdminDB
     .from("conversations")
     .update({ last_message_at: new Date().toISOString() })
@@ -141,26 +158,31 @@ export const reply = async (req, res) => {
     console.error("[reply] failed to bump last_message_at for", conversationId, touchErr);
   }
 
-  // WhatsApp notification to the other participant, if they're a business
-  // with a verified phone and the "Messages" preference enabled — no-ops
-  // silently otherwise (see lib/notificationService.js).
+  // ✅ Respond to the browser now — the message is saved, that's the part
+  // the "send" spinner is waiting on. Everything below (WhatsApp
+  // notification) is best-effort and must not hold the response open.
+  res.json({ ok: true, data: inserted });
+
+  // ── Fire-and-forget notification, AFTER the response has been sent ──
   const recipientId = convo.participant_one === userId ? convo.participant_two : convo.participant_one;
 
-  let jobTitle = "your job posting";
-  if (convo.job_id) {
-    const { data: job } = await supabase.from("jobs").select("title").eq("id", convo.job_id).maybeSingle();
-    if (job?.title) jobTitle = job.title;
-  }
+  (async () => {
+    let jobTitle = "your job posting";
+    if (convo.job_id) {
+      const { data: job } = await supabase.from("jobs").select("title").eq("id", convo.job_id).maybeSingle();
+      if (job?.title) jobTitle = job.title;
+    }
 
-  const { data: senderUser } = await messagingAdminDB
-    .from("users")
-    .select("display_name")
-    .eq("id", userId)
-    .maybeSingle();
+    const { data: senderUser } = await messagingAdminDB
+      .from("users")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
 
-  await notificationService.notifyNewMessage(recipientId, senderUser?.display_name || "Someone", jobTitle);
-
-  return res.json({ ok: true, data: inserted });
+    notifyNewMessageInBackground(recipientId, senderUser?.display_name || "Someone", jobTitle);
+  })().catch((err) => {
+    console.error("[reply] background notification setup failed:", err?.message || err);
+  });
 };
 
 // =============================
@@ -210,17 +232,18 @@ export const startConversation = async (req, res) => {
     console.error("[startConversation] failed to bump last_message_at for", conversationId, touchErr);
   }
 
-  // WhatsApp notification to the recipient, if they're a business with a
-  // verified phone and the "Messages" preference enabled — no-ops silently
-  // otherwise. startConversation never tags job_id, so no job title to look
-  // up here (unlike reply, above).
-  const { data: senderUser } = await messagingAdminDB
-    .from("users")
-    .select("display_name")
-    .eq("id", userId)
-    .maybeSingle();
+  // ✅ Same fix as reply(): respond first, notify after.
+  res.json({ ok: true, conversationId });
 
-  await notificationService.notifyNewMessage(otherUserId, senderUser?.display_name || "Someone", "your job posting");
+  (async () => {
+    const { data: senderUser } = await messagingAdminDB
+      .from("users")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
 
-  return res.json({ ok: true, conversationId });
+    notifyNewMessageInBackground(otherUserId, senderUser?.display_name || "Someone", "your job posting");
+  })().catch((err) => {
+    console.error("[startConversation] background notification setup failed:", err?.message || err);
+  });
 };

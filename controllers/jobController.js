@@ -1063,8 +1063,73 @@ export const openApplicantChat = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-// export const notifyJobApproved = async (businessId, jobTitle) => {
-// };
+// ═══════════════════════════════════════════════════════════════════════════
+// ADD THIS to controllers/jobs.controller.js — new export, nothing else in
+// that file needs to change. Place it near getMyInformalApplicants, since it
+// uses the exact same ownership check.
+//
+// Informal-jobs-only: ownership here is submitted_by_business_id alone —
+// same as getMyInformalApplicants. Formal jobs are NOT included.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// export const notifyJobRejected = async (businessId, jobTitle, reason) => {
-// };
+// ─── BUSINESS DASHBOARD: analytics for MY informal jobs ──────────────────────
+// Views/clicks/applications per job, plus where applicants said they were
+// when they applied (applications.applicant_location — captured only for
+// informal jobs; see createApplication in applications.controller.js).
+// Jobnix doesn't track page-view geography per business (that only exists
+// platform-wide, in the admin dashboard's separate click-tracking table), so
+// this reports "applicants by area", not "views by area" — accurate to what
+// the data actually is.
+export const getMyInformalJobsAnalytics = async (req, res) => {
+  try {
+    const { data: jobs, error: jobsErr } = await supabase
+      .from("jobs")
+      .select("id, title, role_category, location, status, view_count, click_count, application_count, created_date")
+      .eq("work_type", "informal")
+      .eq("submitted_by_business_id", req.businessId)
+      .order("created_date", { ascending: false });
+    if (jobsErr) throw jobsErr;
+
+    const jobIds = jobs.map((j) => j.id);
+
+    let locationsByJob = {};
+    if (jobIds.length > 0) {
+      const { data: apps, error: appsErr } = await supabase
+        .from("applications")
+        .select("job_id, applicant_location")
+        .in("job_id", jobIds)
+        .not("applicant_location", "is", null);
+      if (appsErr) throw appsErr;
+
+      apps.forEach((a) => {
+        const loc = (a.applicant_location || "").trim();
+        if (!loc) return;
+        if (!locationsByJob[a.job_id]) locationsByJob[a.job_id] = {};
+        locationsByJob[a.job_id][loc] = (locationsByJob[a.job_id][loc] || 0) + 1;
+      });
+    }
+
+    const data = jobs.map((j) => {
+      const locCounts = locationsByJob[j.id] || {};
+      const applicant_locations = Object.entries(locCounts)
+        .map(([location, count]) => ({ location, count }))
+        .sort((a, b) => b.count - a.count);
+
+      return {
+        id: j.id,
+        title: j.title,
+        role_category: j.role_category,
+        location: j.location,
+        status: j.status,
+        views: j.view_count || 0,
+        clicks: j.click_count || 0,
+        applicant_count: j.application_count || 0,
+        applicant_locations, // [{ location, count }]
+      };
+    });
+
+    return res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
