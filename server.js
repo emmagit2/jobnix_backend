@@ -28,6 +28,7 @@ import whatsappRoutes from "./route/whatsapp.js";
 import paymentRoutes from "./route/paymentRoutes.js";
 import accountRoutes from "./route/accountRoutes.js";
 import notificationRoutes from "./route/notificationRoutes.js";
+import seekerNotificationRoutes from "./route/seekerNotificationRoutes.js"; // job-seeker-facing bell, separate from business notifications — corporate not mounted yet, still WIP
 import cronRoutes from "./route/cronRoutes.js";
 import referralRoutes from "./route/Referral.routes.js";
 import agentRoutes from "./route/agent.routes.js";
@@ -90,6 +91,7 @@ app.use("/api/payments", paymentRoutes);
 app.use("/api/whatsapp", whatsappRoutes);
 app.use("/api/account", accountRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/seeker/notifications", seekerNotificationRoutes); // corporate not mounted yet — not ready
 app.use("/api/cron", cronRoutes);
 app.use("/api/ai", aiRoutes);
 app.use("/api/jobs", jobRoutes);
