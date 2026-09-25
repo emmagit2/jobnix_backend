@@ -29,6 +29,8 @@ import paymentRoutes from "./route/paymentRoutes.js";
 import accountRoutes from "./route/accountRoutes.js";
 import notificationRoutes from "./route/notificationRoutes.js";
 import cronRoutes from "./route/cronRoutes.js";
+import referralRoutes from "./route/Referral.routes.js";
+import agentRoutes from "./route/agent.routes.js";
 
 dotenv.config();
 
@@ -96,6 +98,8 @@ app.use("/api/companies", companyRoutes);
 app.use("/api/roles", rolesRoutes);
 app.use("/api/messages", userMessagesRoutes); // requireAuth on everything under here
 app.use("/api/emails", emailsRouter);
+app.use("/api/referrals", referralRoutes); // business "refer & earn 30%"
+app.use("/api/agents", agentRoutes); // agent commission tracking
 
 // ── Existing production route mounts (broader "/api" paths — kept last so
 // they can't shadow the more specific routers above) ─────────────────────
