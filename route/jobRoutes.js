@@ -25,7 +25,7 @@ import {
   getMyInformalJobsAnalytics,
 } from "../controllers/jobController.js";
 import adminCheck from "../middleware/adminCheck.js";
-import requireAuth from "../middleware/RequireAuth.js";
+import requireAuth from "../middleware/requireAuth.js";
 import requireBusinessAccount from "../middleware/requireBusinessAccount.js";
 
 const router = express.Router();
