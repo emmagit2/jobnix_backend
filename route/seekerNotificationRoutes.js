@@ -1,6 +1,6 @@
 // routes/seekerNotificationRoutes.js
 import express from "express";
-import requireAuth from "../middleware/RequireAuth.js";
+import requireAuth from "../middleware/requireAuth.js";
 import * as ctrl from "../controllers/seekerNotificationController.js";
 
 const router = express.Router();
