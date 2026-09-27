@@ -1,5 +1,5 @@
 import { Router } from "express";
-import requireAuth from "../middleware/RequireAuth.js";
+import requireAuth from "../middleware/requireAuth.js";
 import adminCheck from "../middleware/adminCheck.js";
 import {
   createApplication,
