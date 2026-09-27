@@ -1,7 +1,7 @@
 // route/referralRoutes.js
 import express from "express";
 import { getMyReferralCode, getReferralStats, attachReferral } from "../controllers/referralController.js";
-import requireAuth from "../middleware/RequireAuth.js";
+import requireAuth from "../middleware/requireAuth.js";
 
 const router = express.Router();
 
