@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import {
   getJobs,
   getJobById,
@@ -13,6 +13,8 @@ import {
   getJobStats,
   getJobApplicants,
   submitInformalJob,
+  updateInformalJob,
+  deleteInformalJob,
   confirmInformalJobPayment,
   getPendingJobs,
   approveJob,
@@ -52,6 +54,16 @@ router.get("/analytics", [requireAuth, requireBusinessAccount], getMyInformalJob
 // always lands as status "pending" + payment_status "pending". Never goes
 // live until payment is confirmed AND an admin approves it.
 router.post("/informal", [requireAuth, requireBusinessAccount], submitInformalJob);
+
+// Business: edit or delete ONE of their own informal jobs. Ownership is
+// checked inside the controller (submitted_by_business_id === req.businessId),
+// same pattern as getMyInformalApplicants — a 404 is returned rather than
+// 403 if the job isn't theirs, so we don't reveal whether the id exists.
+// Two-segment paths ("/informal/:id"), so these don't collide with the
+// generic single-segment "/:id" GET/PUT/DELETE routes further down, but
+// kept right next to the "/informal" POST above for readability.
+router.patch("/informal/:id", [requireAuth, requireBusinessAccount], updateInformalJob);
+router.delete("/informal/:id", [requireAuth, requireBusinessAccount], deleteInformalJob);
 
 // Admin queue: informal jobs that are paid and awaiting review.
 router.get("/pending", adminCheck, getPendingJobs);

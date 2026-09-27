@@ -45,9 +45,7 @@ export async function getMyReferralCode(req, res) {
     res.status(500).json({ success: false, message: "Failed to get referral code" });
   }
 }
-
-// GET /api/referrals/stats
-// Returns the stats + referral list for the "Refer & Earn" page.
+ 
 export async function getReferralStats(req, res) {
   try {
     const businessId = req.userId;
@@ -65,7 +63,10 @@ export async function getReferralStats(req, res) {
       .eq("referrer_business_id", businessId);
     if (earnErr) throw earnErr;
 
-    const totalEarned = earnings.reduce((sum, e) => sum + Number(e.commission_amount), 0);
+    const paidEarnings = earnings.filter((e) => e.status === "paid");
+    const pendingEarnings = earnings.filter((e) => e.status === "pending");
+    const totalEarned = paidEarnings.reduce((sum, e) => sum + Number(e.commission_amount), 0);
+    const totalPending = pendingEarnings.reduce((sum, e) => sum + Number(e.commission_amount), 0);
 
     const now = new Date();
     const activeThisMonth = new Set(
@@ -79,13 +80,17 @@ export async function getReferralStats(req, res) {
 
     const referrals = referredBusinesses.map((b) => {
       const bEarnings = earnings.filter((e) => e.referred_business_id === b.id);
-      const earned = bEarnings.reduce((sum, e) => sum + Number(e.commission_amount), 0);
+      const bPaid = bEarnings.filter((e) => e.status === "paid");
+      const bPending = bEarnings.filter((e) => e.status === "pending");
+      const earned = bPaid.reduce((sum, e) => sum + Number(e.commission_amount), 0);
+      const pending = bPending.reduce((sum, e) => sum + Number(e.commission_amount), 0);
       return {
         id: b.id,
         name: b.business_name,
         date: b.referred_at,
-        status: bEarnings.length > 0 ? "Active" : "Pending",
+        status: bPaid.length > 0 ? "Active" : "Pending",
         earned,
+        pending, // ⬅️ NEW — amount still awaiting job approval for this referral
       };
     });
 
@@ -94,6 +99,7 @@ export async function getReferralStats(req, res) {
       stats: {
         businesses_referred: referredBusinesses.length,
         total_earned: totalEarned,
+        total_pending: totalPending, // ⬅️ NEW
         active_this_month: activeThisMonth,
       },
       referrals,
@@ -103,7 +109,6 @@ export async function getReferralStats(req, res) {
     res.status(500).json({ success: false, message: "Failed to get referral stats" });
   }
 }
-
 // POST /api/referrals/signup  { referral_code, business_id }
 // Called during/after a new business's signup flow if they arrived via
 // jobnix.com/r/CODE, to link them to whoever referred them.

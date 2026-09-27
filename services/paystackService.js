@@ -5,9 +5,8 @@ const PAYSTACK_BASE_URL = "https://api.paystack.co";
 const CALLBACK_URL = `${process.env.API_BASE_URL || "http://localhost:5000"}/api/payments/callback`;
 
 if (!PAYSTACK_SECRET_KEY) {
-  // Fail loudly at startup rather than later with a cryptic 401 from
-  // Paystack's API the first time someone tries to pay.
-  console.warn("⚠️  PAYSTACK_SECRET_KEY is not set — payment endpoints will fail.");
+  
+  console.warn(" PAYSTACK_SECRET_KEY is not set — payment endpoints will fail.");
 }
 
 // ─── Start a transaction — returns { authorization_url, access_code, reference } ─

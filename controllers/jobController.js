@@ -54,14 +54,7 @@ const getFullJob = async (id) => {
 
   return { ...withPoster, requirements };
 };
-
-// ─── Helper: fetch full job by SLUG or UUID ───────────────────────────────────
-// NOTE: intentionally NOT filtered by status here — a business or admin can
-// still open a pending job's detail page directly (e.g. to preview it while
-// it's under review). Public discovery (the list) is what's locked down, in
-// getJobs below. If you'd rather a pending/rejected job's link also 404 for
-// everyone until approved, add .eq("status", "approved") right after the
-// .eq(isUUID ? "id" : "slug", slugOrId) line below.
+ 
 const getFullJobBySlugOrId = async (slugOrId) => {
   const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(slugOrId);
 
@@ -810,6 +803,38 @@ export const approveJob = async (req, res) => {
       .single();
     if (error) throw error;
 
+    // ⬇️ Mark any pending referral commission tied to this job as paid,
+    // now that the job it was earned from has actually been approved —
+    // then notify the referrer that they've earned a confirmed commission.
+    try {
+      const { data: paidRows, error: refErr } = await supabase
+        .from("referral_earnings")
+        .update({ status: "paid", paid_at: new Date().toISOString() })
+        .eq("job_id", id)
+        .eq("status", "pending")
+        .select("referrer_business_id, commission_amount, currency, referred_business_id");
+      if (refErr) throw refErr;
+
+      for (const row of paidRows || []) {
+        const { data: referredBiz } = await supabase
+          .from("business_profiles")
+          .select("business_name")
+          .eq("id", row.referred_business_id)
+          .maybeSingle();
+
+        if (typeof notificationService.notifyReferralCommissionEarned === "function") {
+          await notificationService.notifyReferralCommissionEarned(
+            row.referrer_business_id,
+            referredBiz?.business_name || "a referred business",
+            row.commission_amount,
+            row.currency
+          );
+        }
+      }
+    } catch (refErr) {
+      console.error("referral_earnings update/notify failed (non-fatal):", refErr.message);
+    }
+
     // Notifications not wired up yet — don't let a missing/broken notifier
     // block the actual approval. Remove this try/catch once
     // notifyJobApproved is implemented and tested.
@@ -1129,6 +1154,114 @@ export const getMyInformalJobsAnalytics = async (req, res) => {
     });
 
     return res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── BUSINESS: EDIT MY INFORMAL JOB ───────────────────────────────────────────
+// Ownership check mirrors getMyInformalApplicants — submitted_by_business_id
+// must match the caller. If the job had already been approved and is live,
+// editing it pushes it back to "pending" and clears approval — so a business
+// can't silently swap in different content after admin sign-off. If you'd
+// rather approved jobs stay live through an edit, drop the status/approved_by
+// reset below.
+export const updateInformalJob = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      title, location, role_category, description, responsibilities, benefits,
+      salary_min, salary_max, salary_currency, deadline,
+      postAs, agent_name, agent_phone,
+    } = req.body;
+
+    if (!req.businessId) {
+      return res.status(401).json({ success: false, message: "Must be logged in as a business" });
+    }
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from("jobs")
+      .select("id, work_type, submitted_by_business_id, status, slug")
+      .eq("id", id)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+
+    // 404 rather than 403 so we don't reveal that the job exists
+    if (!existing || existing.work_type !== "informal" || existing.submitted_by_business_id !== req.businessId) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+
+    const isAgent = postAs === "agent";
+    if (isAgent && (!agent_name || !agent_phone)) {
+      return res.status(400).json({ success: false, message: "Agent name and phone are required when posting as an agent" });
+    }
+
+    // Keep the same slug suffix, regenerate the readable part in case
+    // title/location changed.
+    const existingShortId = existing.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
+    const slug = generateSlug(title, "", location, existingShortId);
+
+    const wasApproved = existing.status === "approved";
+
+    const { data, error } = await supabase
+      .from("jobs")
+      .update({
+        title, location, role_category, description,
+        responsibilities: responsibilities || [],
+        benefits: benefits || [],
+        salary_min, salary_max, salary_currency,
+        deadline,
+        slug,
+
+        posted_by_type: isAgent ? "agent" : "owner",
+        agent_name: isAgent ? agent_name : null,
+        agent_phone: isAgent ? agent_phone : null,
+        agent_liability_accepted: isAgent ? true : existing.agent_liability_accepted,
+
+        // Force re-review if this was already live — see comment above.
+        ...(wasApproved ? { status: "pending", approved_by: null, approved_at: null } : {}),
+      })
+      .eq("id", id)
+      .select()
+      .single();
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      data,
+      message: wasApproved
+        ? "Job updated — since it was already live, it's back in the review queue."
+        : "Job updated.",
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── BUSINESS: DELETE MY INFORMAL JOB ─────────────────────────────────────────
+export const deleteInformalJob = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!req.businessId) {
+      return res.status(401).json({ success: false, message: "Must be logged in as a business" });
+    }
+
+    const { data: existing, error: fetchErr } = await supabase
+      .from("jobs")
+      .select("id, work_type, submitted_by_business_id")
+      .eq("id", id)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+
+    if (!existing || existing.work_type !== "informal" || existing.submitted_by_business_id !== req.businessId) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+
+    const { error } = await supabase.from("jobs").delete().eq("id", id);
+    if (error) throw error;
+
+    res.json({ success: true, message: "Job deleted" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
