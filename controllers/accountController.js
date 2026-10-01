@@ -1,7 +1,7 @@
 // controllers/accountController.js
 import * as businessProfilesRepo from "../lib/businessProfilesRepo.js";
 import { PLANS } from "../config/plans.js";
-
+import { supabase } from "../config/supabase.js";
 // GET /api/account — powers the "Account" card (Plan, Member since, Delete account)
 // No login endpoint here: your frontend already authenticates via Supabase Auth
 // (Google OAuth etc.) and this backend just verifies that same session token.
@@ -61,4 +61,78 @@ export const applyReferral = async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACCOUNT SWITCHING (job seeker ↔ business)
+// ═══════════════════════════════════════════════════════════════════════════
+const SWITCH_TYPES = ["jobseeker", "business"];
+const uid = (req) => req.userId || req.user?.id;
+
+// GET /api/accounts/me → which accounts I own + which one is active
+export const getMyAccounts = async (req, res) => {
+  try {
+    const id = uid(req);
+    const [prof, owned] = await Promise.all([
+      supabase.from("profiles").select("account_type").eq("id", id).maybeSingle(),
+      supabase.from("user_accounts").select("account_type, onboarded").eq("user_id", id),
+    ]);
+    if (prof.error) throw prof.error;
+    if (owned.error) throw owned.error;
+
+    res.json({
+      success: true,
+      data: {
+        active: prof.data?.account_type || null,
+        accounts: (owned.data || []).filter((r) => r.onboarded).map((r) => r.account_type),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/accounts/switch { accountType }
+export const switchAccount = async (req, res) => {
+  try {
+    const id = uid(req);
+    const { accountType } = req.body;
+    if (!SWITCH_TYPES.includes(accountType)) {
+      return res.status(400).json({ success: false, message: "You can only switch between job seeker and business." });
+    }
+
+    const { data: prof } = await supabase.from("profiles").select("account_type").eq("id", id).maybeSingle();
+    if (prof?.account_type === "corporate") {
+      return res.status(403).json({ success: false, message: "Corporate accounts can't be switched." });
+    }
+
+    const { data: owned, error } = await supabase
+      .from("user_accounts").select("account_type, onboarded")
+      .eq("user_id", id).eq("account_type", accountType).maybeSingle();
+    if (error) throw error;
+
+    if (!owned || !owned.onboarded) {
+      return res.status(403).json({
+        success: false, code: "NEEDS_ONBOARDING", accountType,
+        message: `Set up your ${accountType === "business" ? "business" : "job seeker"} account first.`,
+      });
+    }
+
+    const { error: updErr } = await supabase
+      .from("profiles").update({ account_type: accountType }).eq("id", id);
+    if (updErr) throw updErr;
+
+    res.json({ success: true, data: { active: accountType } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// Call this from onboarding when a user finishes setting up an account type
+export const registerAccount = async (userId, accountType) => {
+  const { error } = await supabase
+    .from("user_accounts")
+    .upsert({ user_id: userId, account_type: accountType, onboarded: true }, { onConflict: "user_id,account_type" });
+  if (error) throw new Error(error.message);
 };

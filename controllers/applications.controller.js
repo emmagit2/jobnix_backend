@@ -1,29 +1,4 @@
-// controllers/applications.controller.js
-//
-// Assumes: req.user is set by requireAuth (raw Supabase auth user) for
-// applicant-facing routes, and by adminCheck (auth user + req.profile,
-// which includes role) for admin routes. Admin routes no longer check
-// req.user.role themselves — adminCheck already verified profile.role
-// === "admin" before the handler runs.
-//
-// NOTE ON PROFILE DATA: `profiles` only holds id/email/role/account_type/
-// onboarded/referral_source/cv_upload_count/match_count. Display fields
-// like full_name, avatar_url, and cv_url live on `user_profiles`, which is
-// linked user_profiles.id -> profiles.id. So applicant details need a
-// two-level embed: applications -> profiles -> user_profiles.
-//
-// NOTE ON EMAILS: a job has two unrelated email fields.
-//   - apply_email: applicant-facing, only used for apply_method = 'email'
-//     jobs. Applicants send *their own* email there — it never touches our
-//     applications table or the recruiter dashboard.
-//   - recruiter_email: the client/recruiter this job was posted for. Used
-//     ONLY for one-click ('platform') jobs, where applications live in our
-//     system and the recruiter needs the code-verified link to see them.
-//     The recruiter-view code flow below sends to recruiter_email, not
-//     apply_email — don't swap these back.
-//
-// Uses the shared service-role Supabase client (bypasses RLS for admin
-// queries and writing applications on the user's behalf).
+ 
 
 import { supabase } from "../config/supabase.js"; // service-role client
 import crypto from "crypto";
@@ -59,8 +34,12 @@ export const createApplication = async (req, res) => {
   if (!job_id || !method) {
     return res.status(400).json({ message: "job_id and method are required" });
   }
-  if (!["platform", "email"].includes(method)) {
-    return res.status(400).json({ message: "method must be 'platform' or 'email'" });
+   
+  if (method === "email") {
+    return res.status(400).json({ message: "Email applications must be sent through the apply-by-email route." });
+  }
+  if (method !== "platform") {
+    return res.status(400).json({ message: "method must be 'platform'" });
   }
 
   const { data: job } = await supabase

@@ -23,6 +23,8 @@ import {
   updateApplicantStatus,
   openApplicantChat,
   getMyInformalJobsAnalytics,
+  applyByEmail,
+  saveMyCv,
 } from "../controllers/jobController.js";
 import adminCheck from "../middleware/adminCheck.js";
 import requireAuth from "../middleware/requireAuth.js";
@@ -70,14 +72,14 @@ router.get("/pending", adminCheck, getPendingJobs);
 
 router.get("/", getJobs);
 
-// Job-seeker facing analytics — two-segment paths, no ordering conflict
-// with "/:id" (different segment count), but grouped here for clarity.
+ 
 router.get("/:id/view", incrementJobView); // call when job detail page loads
 router.post("/:id/click", incrementJobClick); // call when "Apply" is clicked
 
 // Requires a logged-in jobseeker account (applications.applicant_id is a real FK)
 router.post("/:id/apply", requireAuth, applyToJob);
-
+router.post("/:id/apply-email", requireAuth, applyByEmail); 
+router.post("/my-cv", requireAuth, saveMyCv); 
 // Business dashboard: single job's stats card + who applied
 router.get("/:id/stats", [requireAuth, requireBusinessAccount], getJobStats);
 router.get("/:id/applicants", [requireAuth, requireBusinessAccount], getJobApplicants);

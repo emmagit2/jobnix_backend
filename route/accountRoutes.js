@@ -5,6 +5,12 @@ import * as ctrl from "../controllers/accountController.js";
 
 const router = express.Router();
 
+// ── Account switching (job seeker ↔ business) ──
+// requireAuth only: a job seeker has no business account, so
+// requireBusinessAccount would block them from switching.
+router.get("/me", requireAuth, ctrl.getMyAccounts);
+router.post("/switch", requireAuth, ctrl.switchAccount);
+
 // No signup/login here — your frontend already authenticates via Supabase
 // Auth; these just read/manage the business_profiles row for that session.
 router.get("/", requireAuth, requireBusinessAccount, ctrl.getAccount);

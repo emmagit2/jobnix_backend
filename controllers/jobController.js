@@ -3,14 +3,11 @@ import messagingAdminDB from "../lib/messagingAdminDB.js";
 import * as notificationService from "../services/notificationService.js";
 import { PLANS } from "../config/plans.js";
 import { findOrCreateConversation } from "../lib/conversations.js";
-
+import { sendEmail } from "../lib/email.js";
+import { candidateApplicationEmail } from "../lib/emailTemplates.js";
 
 const INFORMAL_JOB_FEE = 1500; // NGN — flat fee to publish an informal job advert
-
-// Table that holds each user's skills. Its "trade" column (jsonb) is a list like
-// [{ trade, organisation, location, serviceArea, yearsExperience }] and is the
-// ONLY skills info shown on the applicant card for informal jobs.
-const SKILLS_TABLE = "user_skills";
+ const SKILLS_TABLE = "user_skills";
 
 /* ─── Slug generator (no extra package needed) ───────────────────── */
 function generateSlug(title, company, location, shortId) {
@@ -233,37 +230,47 @@ export const getJobById = async (req, res) => {
   }
 };
 
+const APPLY_METHODS = ["platform", "email", "link"];
+
+const validateApply = ({ apply_method, apply_email, apply_link, recruiter_email }) => {
+  if (!APPLY_METHODS.includes(apply_method)) {
+    return "Choose how candidates apply: one-click, email, or company website link.";
+  }
+  if (apply_method === "email" && !apply_email) return "An apply email is required for email applications.";
+  if (apply_method === "link" && !apply_link) return "A website link is required for company website applications.";
+  if (apply_method === "platform" && !recruiter_email) return "recruiter_email is required for one-click apply jobs.";
+  return null;
+};
+
+// Builds the apply-related columns so create and update behave identically
+const applyFields = ({ apply_method, apply_email, apply_link, recruiter_email, how_to_apply }) => ({
+  apply_method,
+  apply_link: apply_method === "link" ? apply_link : null,
+  apply_email: apply_method === "email" ? apply_email : null,
+  recruiter_email: apply_method === "platform" ? recruiter_email : null,
+  how_to_apply: how_to_apply || null,
+});
+
 // ─── CREATE JOB (formal / admin / scraped — goes live immediately) ───────────
 export const createJob = async (req, res) => {
   try {
     const {
       title, company_id: rawCompanyId, location, role_category, job_type,
-      work_type, // ✅ 'formal' | 'informal'
+      work_type, // 'formal' | 'informal'
       description, requirements, responsibilities, benefits,
       salary_min, salary_max, salary_currency,
-      apply_method, // ✅ 'platform' | 'email' | 'instructions'
-      apply_link, apply_email, how_to_apply, deadline,
-      recruiter_email, // ✅ client/recruiter contact — only meaningful when apply_method === 'platform'
+      deadline,
+      recruiter_email,
     } = req.body;
 
-    // ✅ work_type is required and must be exactly formal or informal —
-    // matches the DB check constraint, but validate here too for a clean 400
-    // instead of a raw Postgres constraint error.
     if (!work_type || !["formal", "informal"].includes(work_type)) {
       return res.status(400).json({ success: false, message: "work_type must be 'formal' or 'informal'" });
     }
 
-    // ✅ recruiter_email is required for one-click jobs — mirrors the check
-    // in getOrCreateRecruiterLink, so a job can't end up postable without one
-    // and only fail later when someone tries to generate a link.
-    if (apply_method === "platform" && !recruiter_email) {
-      return res.status(400).json({ success: false, message: "recruiter_email is required for one-click apply jobs" });
-    }
+    const applyErr = validateApply(req.body);
+    if (applyErr) return res.status(400).json({ success: false, message: applyErr });
 
-    // ── Free/Premium plan job-count limit ────────────────────────────
-    // Only enforced when the poster has a business_profiles row (i.e. is a
-    // logged-in business account, not a guest/email-only recruiter). Remove
-    // this block if you don't want server-side plan enforcement here.
+    // ── Free/Premium plan job-count limit (only for logged-in business posters) ──
     if (req.businessId) {
       const { data: business } = await supabase
         .from("business_profiles")
@@ -290,21 +297,15 @@ export const createJob = async (req, res) => {
       }
     }
 
-    // ✅ Strip "__other__" sentinel — store null instead
+    // Strip "__other__" sentinel — store null instead
     const company_id = (rawCompanyId && rawCompanyId !== "__other__") ? rawCompanyId : null;
 
-    // ── Fetch company name for the slug ──────────────────────────────
     let companyName = "";
     if (company_id) {
-      const { data: co } = await supabase
-        .from("companies")
-        .select("name")
-        .eq("id", company_id)
-        .single();
+      const { data: co } = await supabase.from("companies").select("name").eq("id", company_id).single();
       companyName = co?.name || "";
     }
 
-    // ── Generate unique slug ─────────────────────────────────────────
     const shortId = Math.random().toString(36).slice(2, 8);
     const slug = generateSlug(title, companyName, location, shortId);
 
@@ -318,11 +319,8 @@ export const createJob = async (req, res) => {
         responsibilities,
         benefits,
         salary_min, salary_max, salary_currency,
-        apply_method,
-        apply_link, apply_email, how_to_apply, deadline,
-        // ✅ Only ever store an email here for one-click jobs — null it out
-        // for email/instructions jobs even if the client sent a stray value.
-        recruiter_email: apply_method === "platform" ? recruiter_email : null,
+        ...applyFields(req.body),
+        deadline,
         slug,
       }])
       .select()
@@ -345,45 +343,29 @@ export const updateJob = async (req, res) => {
     const { id } = req.params;
     const {
       title, company_id: rawCompanyId, location, role_category, job_type,
-      work_type, // ✅ 'formal' | 'informal'
+      work_type,
       description, requirements, responsibilities, benefits,
       salary_min, salary_max, salary_currency,
-      apply_method, // ✅ 'platform' | 'email' | 'instructions'
-      apply_link, apply_email, how_to_apply, deadline,
-      recruiter_email, // ✅ client/recruiter contact — only meaningful when apply_method === 'platform'
+      deadline,
     } = req.body;
 
-    // ✅ Same validation as createJob — required, exactly formal or informal.
     if (!work_type || !["formal", "informal"].includes(work_type)) {
       return res.status(400).json({ success: false, message: "work_type must be 'formal' or 'informal'" });
     }
 
-    // ✅ Same recruiter_email requirement as createJob.
-    if (apply_method === "platform" && !recruiter_email) {
-      return res.status(400).json({ success: false, message: "recruiter_email is required for one-click apply jobs" });
-    }
+    const applyErr = validateApply(req.body);
+    if (applyErr) return res.status(400).json({ success: false, message: applyErr });
 
-    // ✅ Strip "__other__" sentinel — store null instead
     const company_id = (rawCompanyId && rawCompanyId !== "__other__") ? rawCompanyId : null;
 
-    // ── Re-generate slug on update so it stays in sync with title/location ──
     let companyName = "";
     if (company_id) {
-      const { data: co } = await supabase
-        .from("companies")
-        .select("name")
-        .eq("id", company_id)
-        .single();
+      const { data: co } = await supabase.from("companies").select("name").eq("id", company_id).single();
       companyName = co?.name || "";
     }
 
-    // Keep the same shortId suffix by reading the existing slug
-    const { data: existing } = await supabase
-      .from("jobs")
-      .select("slug")
-      .eq("id", id)
-      .single();
-
+    // Keep the same shortId suffix so the job's URL stays recognisable
+    const { data: existing } = await supabase.from("jobs").select("slug").eq("id", id).single();
     const existingShortId = existing?.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
     const slug = generateSlug(title, companyName, location, existingShortId);
 
@@ -397,11 +379,8 @@ export const updateJob = async (req, res) => {
         responsibilities,
         benefits,
         salary_min, salary_max, salary_currency,
-        apply_method,
-        apply_link, apply_email, how_to_apply, deadline,
-        // ✅ Only ever store an email here for one-click jobs — null it out
-        // if the job is switched to email/instructions on this update.
-        recruiter_email: apply_method === "platform" ? recruiter_email : null,
+        ...applyFields(req.body),
+        deadline,
         slug,
       })
       .eq("id", id);
@@ -451,16 +430,7 @@ export const toggleFeaturedJob = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Job analytics (views/clicks/applications), applying, and the
-// business-dashboard "my jobs with stats" endpoints. Needs the migration in
-// supabase/migration_addon.sql run first (adds view_count/click_count/
-// application_count/deadline_notified_at to jobs, plus the applications table
-// and increment_job_view/click/application RPC functions).
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ─── VIEW (public): job seeker opens a job's detail page ─────────────────────
+ 
 export const incrementJobView = async (req, res) => {
   try {
     const { data, error } = await supabase.rpc("increment_job_view", { p_job_id: req.params.id });
@@ -548,8 +518,176 @@ export const applyToJob = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
- 
 
+// ─── Save the uploaded CV path to the user's profile ─────────────────────────
+export const saveMyCv = async (req, res) => {
+  try {
+    const { cvPath } = req.body;
+    const userId = req.userId || req.user?.id;
+
+    // The path must live inside the user's own folder in the bucket
+    if (!cvPath || typeof cvPath !== "string" || !cvPath.startsWith(`${userId}/`)) {
+      return res.status(400).json({ success: false, message: "Invalid CV path" });
+    }
+
+    const { data, error } = await supabase
+      .from("user_profiles")
+      .update({ cv_url: cvPath, cv_uploaded: true })
+      .eq("id", userId)
+      .select("id");
+    if (error) throw error;
+
+    // No profile row yet: create a minimal one so the CV has somewhere to live
+    if (!data?.length) {
+      const { data: authUser } = await supabase.auth.admin.getUserById(userId);
+      const { error: insErr } = await supabase.from("user_profiles").insert({
+        id: userId,
+        email: authUser?.user?.email || null,
+        full_name: authUser?.user?.user_metadata?.full_name || null,
+        cv_url: cvPath,
+        cv_uploaded: true,
+      });
+      if (insErr) throw insErr;
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+ 
+// ═══════════════════════════════════════════════════════════════════════════
+// APPLY BY EMAIL — server sends the branded email to the job's apply_email,
+// with the applicant's CV attached (or a CV / profile link as a fallback).
+// Needs: sendEmail (lib/email.js) and candidateApplicationEmail
+// (lib/emailTemplates.js) imported at the top of this file.
+// ═══════════════════════════════════════════════════════════════════════════
+
+ const CV_BUCKET = "cvs"; // 👈 change to your real bucket name
+
+async function fetchCvAttachment(cvPath, applicantName) {
+  try {
+    const { data: blob, error } = await supabase.storage.from(CV_BUCKET).download(cvPath);
+    if (error || !blob) return null;
+
+    const buf = Buffer.from(await blob.arrayBuffer());
+    if (buf.length > 5 * 1024 * 1024) return null; // skip attaching CVs over 5 MB
+    const ext = (cvPath.split(".").pop() || "pdf").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "pdf";
+    const safeName = applicantName.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "") || "Applicant";
+    return { filename: `${safeName}_CV.${ext}`, content: buf };
+  } catch {
+    return null;
+  }
+}
+
+export const applyByEmail = async (req, res) => {
+  try {
+    const { id: jobId } = req.params;
+
+    const { data: job, error: jobErr } = await supabase
+      .from("jobs").select("*").eq("id", jobId).maybeSingle();
+    if (jobErr) throw jobErr;
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
+
+    // Recipient always comes from the DB, never from the client
+    if (job.apply_method !== "email" || !job.apply_email) {
+      return res.status(400).json({ success: false, message: "This job does not accept email applications" });
+    }
+    if (job.deadline && new Date(job.deadline) < new Date(new Date().toDateString())) {
+      return res.status(400).json({ success: false, message: "This job is no longer accepting applications" });
+    }
+
+    const { data: already } = await supabase
+      .from("applications").select("id")
+      .eq("job_id", jobId).eq("applicant_id", req.userId).maybeSingle();
+    if (already) return res.status(409).json({ success: false, message: "You've already applied to this job" });
+
+    // ⚠️ "username" = the column behind jobnix.ng/u/<username>. Rename if yours differs.
+    const { data: profile, error: profErr } = await supabase
+      .from("user_profiles")
+      .select("full_name, email, cv_url, headline, username")
+      .eq("id", req.userId).maybeSingle();
+    if (profErr) throw profErr;
+
+
+    // Must be acting as a job seeker
+    const { data: me } = await supabase.from("profiles").select("account_type").eq("id", req.userId).maybeSingle();
+    if (me?.account_type && me.account_type !== "jobseeker") {
+      return res.status(403).json({ success: false, code: "WRONG_ACCOUNT", message: "Switch to your job seeker account to apply." });
+    }
+
+    // Can't apply to your own job
+    const myEmail = (profile?.email || "").toLowerCase();
+    const ownEmails = [job.apply_email, job.recruiter_email].map((e) => (e || "").toLowerCase());
+    if (job.submitted_by_business_id === req.userId || (myEmail && ownEmails.includes(myEmail))) {
+      return res.status(400).json({ success: false, message: "You can't apply to your own job." });
+    }
+    // Need at least a CV or a public profile to send the employer
+    if (!profile?.cv_url && !profile?.username) {
+      return res.status(400).json({ success: false, code: "NO_CV", message: "Upload your CV to your profile first" });
+    }
+
+    const [withCompany] = await attachPosterInfo([job]);
+    const applicantName = profile.full_name || "Applicant";
+
+    const attachment = profile.cv_url ? await fetchCvAttachment(profile.cv_url, applicantName) : null;
+    
+        // Signed link for the "View CV" fallback (valid 7 days)
+    let cvLink = null;
+    if (profile.cv_url) {
+      const { data: signed } = await supabase.storage
+        .from(CV_BUCKET)
+        .createSignedUrl(profile.cv_url, 60 * 60 * 24 * 7);
+      cvLink = signed?.signedUrl || null;
+    }
+    const { subject, html } = candidateApplicationEmail({
+      jobTitle: job.title,
+      companyName: withCompany.company_name,
+      applicantName,
+      applicantEmail: profile.email,
+      headline: profile.headline,
+      cvAttached: !!attachment,
+      cvUrl: cvLink,
+       profileUrl: profile.username ? `https://jobnix.ng/u/${profile.username}` : null,
+      jobUrl: `https://jobnix.ng/jobs/${job.slug || job.id}`,
+    });
+
+    // Send FIRST. If it fails, nothing is recorded and the candidate can retry.
+    try {
+      await sendEmail({
+        to: job.apply_email,
+        replyTo: profile.email,
+        subject,
+        html,
+        attachments: attachment ? [attachment] : [],
+      });
+    } catch (mailErr) {
+      console.error("applyByEmail: send failed:", mailErr.message);
+      return res.status(502).json({
+        success: false, code: "EMAIL_FAILED",
+        message: "We couldn't send your application. Please try again.",
+      });
+    }
+
+    const { data: application, error: appErr } = await supabase
+      .from("applications")
+      .insert({
+        job_id: jobId,
+        applicant_id: req.userId,
+        method: "email",
+        email_sent_to: job.apply_email,
+        email_body: `Application email sent for "${job.title}"${attachment ? " with CV attached" : ""}.`,
+      })
+      .select().single();
+
+    if (appErr) console.error("applyByEmail: email sent but saving application failed:", appErr.message);
+    else await supabase.rpc("increment_job_application", { p_job_id: jobId });
+
+    res.status(201).json({ success: true, data: { cvAttached: !!attachment, application } });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
 
 // ─── JOB STATS (business dashboard): one job's view/click/application card ───
 export const getJobStats = async (req, res) => {
