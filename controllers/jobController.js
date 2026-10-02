@@ -221,7 +221,7 @@ export const getJobById = async (req, res) => {
   try {
     const { id } = req.params;
     const data = await getFullJobBySlugOrId(id);
-    if (!data) {
+    if (!data || data.status === "draft") {
       return res.status(404).json({ success: false, message: "Job not found" });
     }
     res.json({ success: true, data });
@@ -463,10 +463,9 @@ export const applyToJob = async (req, res) => {
     const { coverNote } = req.body;
     const { id: jobId } = req.params;
  
-    const { data: job, error: jobErr } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
-    if (jobErr) throw jobErr;
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
- 
+  const { data: job, error: jobErr } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
+if (jobErr) throw jobErr;
+if (!job || job.status === "draft") return res.status(404).json({ success: false, message: "Job not found" });
     const { data: already } = await supabase
       .from("applications")
       .select("id")
@@ -584,11 +583,10 @@ export const applyByEmail = async (req, res) => {
   try {
     const { id: jobId } = req.params;
 
-    const { data: job, error: jobErr } = await supabase
-      .from("jobs").select("*").eq("id", jobId).maybeSingle();
-    if (jobErr) throw jobErr;
-    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
-
+  const { data: job, error: jobErr } = await supabase
+  .from("jobs").select("*").eq("id", jobId).maybeSingle();
+if (jobErr) throw jobErr;
+if (!job || job.status === "draft") return res.status(404).json({ success: false, message: "Job not found" });
     // Recipient always comes from the DB, never from the client
     if (job.apply_method !== "email" || !job.apply_email) {
       return res.status(400).json({ success: false, message: "This job does not accept email applications" });
@@ -1400,6 +1398,168 @@ export const deleteInformalJob = async (req, res) => {
     if (error) throw error;
 
     res.json({ success: true, message: "Job deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+ 
+
+const loadDraft = async (id) => {
+  const { data } = await supabase.from("jobs").select("*").eq("id", id).maybeSingle();
+  return data && data.status === "draft" ? data : null;
+};
+
+// ─── SAVE DRAFT (create or update). Only a title is required. ───────────────
+// First save: no `id` in the body → insert. Later saves: send the returned id.
+export const saveAdminDraft = async (req, res) => {
+  try {
+    const {
+      id, title, company_id: rawCompanyId, location, role_category, job_type,
+      work_type, description, requirements, responsibilities, benefits,
+      salary_min, salary_max, salary_currency, deadline,
+      apply_method, apply_email, apply_link, recruiter_email, how_to_apply,
+    } = req.body;
+
+    if (!title?.trim()) {
+      return res.status(400).json({ success: false, message: "Give the draft a title so you can find it later" });
+    }
+
+    let existing = null;
+    if (id) {
+      existing = await loadDraft(id);
+      if (!existing) return res.status(404).json({ success: false, message: "Draft not found" });
+    }
+
+    const company_id = rawCompanyId && rawCompanyId !== "__other__" ? rawCompanyId : null;
+    let companyName = "";
+    if (company_id) {
+      const { data: co } = await supabase.from("companies").select("name").eq("id", company_id).maybeSingle();
+      companyName = co?.name || "";
+    }
+
+    const shortId = existing?.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
+    const slug = generateSlug(title, companyName, location, shortId);
+
+    // No validateApply here: a draft may be half-filled. Publish validates.
+    const row = {
+      title: title.trim(),
+      company_id,
+      location: location || null,
+      role_category: role_category || null,
+      job_type: job_type || null,
+      work_type: ["formal", "informal"].includes(work_type) ? work_type : "formal",
+      description: description || null,
+      requirements: [],
+      responsibilities: responsibilities || [],
+      benefits: benefits || [],
+      salary_min: salary_min ?? null,
+      salary_max: salary_max ?? null,
+      salary_currency: salary_currency || "NGN",
+      deadline: deadline || null,
+      apply_method: APPLY_METHODS.includes(apply_method) ? apply_method : "platform",
+      apply_link: apply_link || null,
+      apply_email: apply_email || null,
+      recruiter_email: recruiter_email || null,
+      how_to_apply: how_to_apply || null,
+      slug,
+      status: "draft",
+      ...(existing ? {} : { drafted_by: req.userId }),
+    };
+
+    const q = existing
+      ? supabase.from("jobs").update(row).eq("id", existing.id)
+      : supabase.from("jobs").insert([row]);
+    const { data, error } = await q.select().single();
+    if (error) throw error;
+
+    await syncRequirementsTags(data.id, requirements);
+
+    res.status(existing ? 200 : 201).json({ success: true, data: await getFullJob(data.id), message: "Draft saved" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── LIST DRAFTS ─────────────────────────────────────────────────────────────
+export const getAdminDrafts = async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("jobs")
+      .select("id, title, location, role_category, job_type, work_type, deadline, company_id, drafted_by, created_date")
+      .eq("status", "draft")
+      .order("created_date", { ascending: false });
+    if (error) throw error;
+
+    const withCo = data.length ? await attachPosterInfo(data) : [];
+    res.json({ success: true, data: withCo });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── GET ONE DRAFT (prefill the form) ────────────────────────────────────────
+export const getAdminDraftById = async (req, res) => {
+  try {
+    const draft = await loadDraft(req.params.id);
+    if (!draft) return res.status(404).json({ success: false, message: "Draft not found" });
+    res.json({ success: true, data: await getFullJob(draft.id) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── DELETE DRAFT ────────────────────────────────────────────────────────────
+export const deleteAdminDraft = async (req, res) => {
+  try {
+    const draft = await loadDraft(req.params.id);
+    if (!draft) return res.status(404).json({ success: false, message: "Draft not found" });
+
+    await supabase.from("requirements_tags").delete().eq("job_id", draft.id);
+    const { error } = await supabase.from("jobs").delete().eq("id", draft.id);
+    if (error) throw error;
+    res.json({ success: true, message: "Draft deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ─── PUBLISH DRAFT → goes live immediately, like createJob ───────────────────
+export const publishAdminDraft = async (req, res) => {
+  try {
+    const draft = await loadDraft(req.params.id);
+    if (!draft) return res.status(404).json({ success: false, message: "Draft not found" });
+
+    const required = ["title", "location", "role_category", "job_type", "description", "deadline"];
+    const missing = required.filter((k) => !draft[k] || !String(draft[k]).trim());
+    if (missing.length) {
+      return res.status(400).json({
+        success: false, code: "DRAFT_INCOMPLETE", missing,
+        message: `Complete these fields before publishing: ${missing.join(", ")}`,
+      });
+    }
+
+    if (new Date(draft.deadline) < new Date(new Date().toDateString())) {
+      return res.status(400).json({ success: false, message: "The deadline has already passed. Update it before publishing." });
+    }
+
+    const applyErr = validateApply(draft);
+    if (applyErr) return res.status(400).json({ success: false, message: applyErr });
+
+    const now = new Date().toISOString();
+    const { error } = await supabase
+      .from("jobs")
+      .update({
+        ...applyFields(draft),
+        status: "approved",
+        approved_by: req.userId,
+        approved_at: now,
+        created_date: now, // so it sorts as new in getJobs
+      })
+      .eq("id", draft.id);
+    if (error) throw error;
+
+    res.json({ success: true, data: await getFullJob(draft.id), message: "Job published" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

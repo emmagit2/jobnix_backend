@@ -25,6 +25,11 @@ import {
   getMyInformalJobsAnalytics,
   applyByEmail,
   saveMyCv,
+  saveAdminDraft,
+  getAdminDrafts,
+  getAdminDraftById,
+  publishAdminDraft,
+  deleteAdminDraft,
 } from "../controllers/jobController.js";
 import adminCheck from "../middleware/adminCheck.js";
 import requireAuth from "../middleware/requireAuth.js";
@@ -36,9 +41,9 @@ const router = express.Router();
 // PUBLIC / BUSINESS ROUTES
 // =============================
 // Single-segment paths ("/mine", "/applicants", "/analytics", "/informal",
-// "/pending") MUST all be registered before the generic "/:id" below —
-// otherwise Express matches them as GET/POST /:id with
-// id="mine"/"applicants"/"analytics"/... and the real handler never runs.
+// "/pending", "/drafts") MUST all be registered before the generic "/:id"
+// below — otherwise Express matches them as GET/POST /:id with
+// id="mine"/"applicants"/"analytics"/"drafts"... and the real handler never runs.
 
 router.get("/mine", [requireAuth, requireBusinessAccount], getMyJobs);
 
@@ -58,47 +63,47 @@ router.get("/analytics", [requireAuth, requireBusinessAccount], getMyInformalJob
 router.post("/informal", [requireAuth, requireBusinessAccount], submitInformalJob);
 
 // Business: edit or delete ONE of their own informal jobs. Ownership is
-// checked inside the controller (submitted_by_business_id === req.businessId),
-// same pattern as getMyInformalApplicants — a 404 is returned rather than
-// 403 if the job isn't theirs, so we don't reveal whether the id exists.
-// Two-segment paths ("/informal/:id"), so these don't collide with the
-// generic single-segment "/:id" GET/PUT/DELETE routes further down, but
-// kept right next to the "/informal" POST above for readability.
+// checked inside the controller (submitted_by_business_id === req.businessId).
 router.patch("/informal/:id", [requireAuth, requireBusinessAccount], updateInformalJob);
 router.delete("/informal/:id", [requireAuth, requireBusinessAccount], deleteInformalJob);
 
 // Admin queue: informal jobs that are paid and awaiting review.
 router.get("/pending", adminCheck, getPendingJobs);
 
+// Admin drafts — MUST come before any "/:id" route.
+// requireAuth sets req.userId (used for drafted_by / approved_by);
+// adminCheck confirms the user is an admin.
+router.post("/drafts",             requireAuth, adminCheck, saveAdminDraft);
+router.get("/drafts",              requireAuth, adminCheck, getAdminDrafts);
+router.get("/drafts/:id",          requireAuth, adminCheck, getAdminDraftById);
+router.post("/drafts/:id/publish", requireAuth, adminCheck, publishAdminDraft);
+router.delete("/drafts/:id",       requireAuth, adminCheck, deleteAdminDraft);
+
 router.get("/", getJobs);
 
- 
 router.get("/:id/view", incrementJobView); // call when job detail page loads
 router.post("/:id/click", incrementJobClick); // call when "Apply" is clicked
 
 // Requires a logged-in jobseeker account (applications.applicant_id is a real FK)
 router.post("/:id/apply", requireAuth, applyToJob);
-router.post("/:id/apply-email", requireAuth, applyByEmail); 
-router.post("/my-cv", requireAuth, saveMyCv); 
+router.post("/:id/apply-email", requireAuth, applyByEmail);
+router.post("/my-cv", requireAuth, saveMyCv);
+
 // Business dashboard: single job's stats card + who applied
 router.get("/:id/stats", [requireAuth, requireBusinessAccount], getJobStats);
 router.get("/:id/applicants", [requireAuth, requireBusinessAccount], getJobApplicants);
 
-// Payment webhook callback — this should be called by your payment
-// provider's server-to-server webhook, not directly from the client.
-// If your webhook can't carry a business's auth token, swap requireAuth
-// out for your webhook-signature verification middleware instead.
+// Payment webhook callback — should be called by your payment provider's
+// server-to-server webhook, not directly from the client.
 router.post("/:id/confirm-payment", confirmInformalJobPayment);
 
-// Generic "/:id" LAST among single-segment GETs — must come after "/mine",
-// "/applicants", "/analytics", "/informal", and "/pending" above.
+// Generic "/:id" LAST among single-segment GETs.
 router.get("/:id", getJobById);
 
 // =============================
 // ADMIN ROUTES
 // =============================
-// CREATE JOB (formal / admin / scraped — goes live immediately, unlike
-// the business-facing "/informal" route above)
+// CREATE JOB (formal / admin / scraped — goes live immediately)
 router.post("/", adminCheck, createJob);
 
 // UPDATE JOB
