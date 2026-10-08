@@ -119,4 +119,4 @@ router.patch("/:id/featured", adminCheck, toggleFeaturedJob);
 router.patch("/:id/approve", adminCheck, approveJob);
 router.patch("/:id/reject", adminCheck, rejectJob);
 
-export default router;
+export default router; 

@@ -1,6 +1,9 @@
 import { v4 as uuidv4 } from "uuid";
 import { supabase } from "../config/supabase.js";
 import { trackJobClick, getAllClicks } from "../services/analytics.service.js";
+import { isBot } from "../utils/botDetector.js";
+import { verifyTurnstile } from "../utils/turnstile.js";
+import { getVisitorGeo } from "../utils/geo.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -10,6 +13,21 @@ const COOKIE_OPTS = {
   sameSite: isProduction ? "none" : "lax",
   secure:   isProduction,
 };
+
+// geoip-lite returns Nigerian states as ISO 3166-2 codes (e.g. "LA"). This turns
+// them into readable names. Unknown codes are shown as-is.
+const NG_STATES = {
+  AB: "Abia", AD: "Adamawa", AK: "Akwa Ibom", AN: "Anambra", BA: "Bauchi",
+  BY: "Bayelsa", BE: "Benue", BO: "Borno", CR: "Cross River", DE: "Delta",
+  EB: "Ebonyi", ED: "Edo", EK: "Ekiti", EN: "Enugu", FC: "Abuja (FCT)",
+  GO: "Gombe", IM: "Imo", JI: "Jigawa", KD: "Kaduna", KN: "Kano",
+  KT: "Katsina", KE: "Kebbi", KO: "Kogi", KW: "Kwara", LA: "Lagos",
+  NA: "Nasarawa", NI: "Niger", OG: "Ogun", ON: "Ondo", OS: "Osun",
+  OY: "Oyo", PL: "Plateau", RI: "Rivers", SO: "Sokoto", TA: "Taraba",
+  YO: "Yobe", ZA: "Zamfara",
+};
+const stateName = (country, region) =>
+  region ? (country === "NG" ? NG_STATES[region] || region : region) : null;
 
 // Click tracking is a PUBLIC route (no requireAuth middleware) — logged-out
 // visitors must still be able to POST. So auth here is OPTIONAL: if a valid
@@ -49,6 +67,32 @@ export const jobClickController = async (req, res) => {
     // Defaults to "view" for safety if an older client ever omits it.
     const eventType = req.body.event_type === "apply_click" ? "apply_click" : "view";
 
+    // user_agent and is_bot are derived from request headers ONLY — never from
+    // req.body. Bots are still stored (so they can be audited) but flagged, and
+    // getAllClicks() excludes them from the dashboard. A logged-in user is never
+    // treated as a bot, even if their UA looks odd.
+    const userAgent = req.headers["user-agent"] || null;
+
+    // Visitor's approximate location, looked up from their IP (the IP itself
+    // is never saved). This is where the VISITOR is — not the job's location.
+    const geo = getVisitorGeo(req);
+    const bot       = !userId && isBot(userAgent);
+
+    // Turnstile: proof the browser is real. A signed "human_ok" cookie remembers
+    // a passed check for 30 days (a Turnstile token only works once). Unverified
+    // clicks are still saved — they just aren't marked human_verified.
+    let humanVerified = !bot && req.signedCookies?.human_ok === "1";
+    if (!bot && !humanVerified && req.body.cf_turnstile_token) {
+      humanVerified = await verifyTurnstile(req.body.cf_turnstile_token, req.ip);
+      if (humanVerified) {
+        res.cookie("human_ok", "1", {
+          ...COOKIE_OPTS,
+          maxAge: 1000 * 60 * 60 * 24 * 30,
+          signed: true,
+        });
+      }
+    }
+
     const result = await trackJobClick({
       job_id:        req.body.job_id,
       job_title:     req.body.job_title,
@@ -59,6 +103,10 @@ export const jobClickController = async (req, res) => {
       visitor_id:    visitorId,
       user_id:       userId,
       event_type:    eventType,
+      user_agent:    userAgent,
+      is_bot:        bot,
+      human_verified: humanVerified,
+      ...geo,
     });
 
     return res.status(201).json({ success: true, data: result });
@@ -77,6 +125,7 @@ export const analyticsOverviewController = async (req, res) => {
     // 304 for this endpoint — analytics must always reflect live data.
     res.set("Cache-Control", "no-store");
 
+    // Bots are excluded by default (see getAllClicks in analytics.service.js).
     const clicks = await getAllClicks();
 
     // ── Top jobs (1 count per visitor per job — dedupe repeat clicks)
@@ -140,6 +189,33 @@ export const analyticsOverviewController = async (req, res) => {
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count);
 
+    // ── Visitor locations: where the PEOPLE are (from IP), 1 count per
+    // visitor. Different from topLocations above, which is where the JOBS are.
+    // Every location people visited from, across ALL users. For each place:
+    //   visitors = how many different people were there
+    //   visits   = how many total clicks came from there
+    // Returned two ways: by city (with its state + country) and by state.
+    const cityMap  = {};
+    const stateMap = {};
+    const bump = (map, key, meta, c) => {
+      if (!map[key]) map[key] = { ...meta, visits: 0, people: new Set() };
+      map[key].visits++;
+      if (c.visitor_id) map[key].people.add(c.visitor_id);
+    };
+    clicks.forEach((c) => {
+      const country = c.visitor_country || "Unknown";
+      const state   = stateName(c.visitor_country, c.visitor_region) || "Unknown";
+      const city    = c.visitor_city || "Unknown";
+      bump(cityMap,  `${country}|${state}|${city}`, { country, state, city }, c);
+      bump(stateMap, `${country}|${state}`,         { country, state },       c);
+    });
+    const finalize = (map) =>
+      Object.values(map)
+        .map(({ people, ...rest }) => ({ ...rest, visitors: people.size }))
+        .sort((a, b) => b.visitors - a.visitors || b.visits - a.visits);
+    const visitorLocations = finalize(cityMap);
+    const visitorStates    = finalize(stateMap);
+
     // ── Visitors: unique + returning vs new
     // "Returning" = visitor_id seen on 2+ distinct calendar days (UTC).
     const visitorDays = {};
@@ -151,6 +227,22 @@ export const analyticsOverviewController = async (req, res) => {
     const totalVisitors = Object.keys(visitorDays).length;
     const returning     = Object.values(visitorDays).filter((d) => d.size > 1).length;
     const newVisitors   = totalVisitors - returning;
+
+    // ── Verified visitors: the most trustworthy tier.
+    // A visitor counts as verified if ANY of their events shows real-person
+    // proof: passed Cloudflare Turnstile, was logged in, or clicked Apply.
+    // (Old rows have no human_verified flag, so they only qualify via the
+    // logged-in / apply-click signals.)
+    const verifiedSet = new Set();
+    let verifiedClicks = 0;
+    clicks.forEach((c) => {
+      const proof = c.human_verified === true || !!c.user_id || c.event_type === "apply_click";
+      if (proof) {
+        verifiedClicks++;
+        if (c.visitor_id) verifiedSet.add(c.visitor_id);
+      }
+    });
+    const verifiedVisitors = verifiedSet.size;
 
     // ── Clicks over time (last 14 days)
     const timeSeries = {};
@@ -180,10 +272,17 @@ export const analyticsOverviewController = async (req, res) => {
         topLocations,
         topCategories,
         topReferrers,
+        visitorLocations,
+        visitorStates,
         clicksOverTime,
         returningUsers: returning,
         newUsers:       newVisitors,
         totalVisitors,
+        verifiedVisitors,
+        verifiedClicks,
+        verifiedRate: totalVisitors > 0
+          ? Math.round((verifiedVisitors / totalVisitors) * 100)
+          : 0,
         returnRate: totalVisitors > 0
           ? Math.round((returning / totalVisitors) * 100)
           : 0,
@@ -194,4 +293,3 @@ export const analyticsOverviewController = async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 };
-
