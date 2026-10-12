@@ -26,6 +26,18 @@ function generateSlug(title, company, location, shortId) {
   return `${base}-${shortId}`;
 }
 
+// ─── Helper: load requirements + responsibilities groups for one job ─────────
+const loadTagGroups = async (job) => {
+  const [{ data: reqTags }, { data: respTags }] = await Promise.all([
+    supabase.from("requirements_tags").select("*").eq("job_id", job.id).order("sort_order"),
+    supabase.from("responsibilities_tags").select("*").eq("job_id", job.id).order("sort_order"),
+  ]);
+  return {
+    requirements: toGroups(reqTags, job.requirements),
+    responsibilities: toGroups(respTags, job.responsibilities),
+  };
+};
+
 // ─── Helper: fetch full job with tags ─────────────────────────────────────────
 const getFullJob = async (id) => {
   const { data: job, error } = await supabase
@@ -37,21 +49,9 @@ const getFullJob = async (id) => {
   if (error || !job) return null;
 
   const [withPoster] = await attachPosterInfo([job]);
-
-  const { data: tags } = await supabase
-    .from("requirements_tags")
-    .select("*")
-    .eq("job_id", id)
-    .order("sort_order");
-
-  const requirements =
-    tags && tags.length > 0
-      ? tags.map(t => ({ tag: t.tag, items: t.items }))
-      : (job.requirements || []);
-
-  return { ...withPoster, requirements };
+  return { ...withPoster, ...(await loadTagGroups(job)) };
 };
- 
+
 const getFullJobBySlugOrId = async (slugOrId) => {
   const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(slugOrId);
 
@@ -64,22 +64,8 @@ const getFullJobBySlugOrId = async (slugOrId) => {
   if (error || !job) return null;
 
   const [withPoster] = await attachPosterInfo([job]);
-
-  const { data: tags } = await supabase
-    .from("requirements_tags")
-    .select("*")
-    .eq("job_id", job.id)
-    .order("sort_order");
-
-  const requirements =
-    tags && tags.length > 0
-      ? tags.map(t => ({ tag: t.tag, items: t.items }))
-      : (job.requirements || []);
-
-  return { ...withPoster, requirements };
+  return { ...withPoster, ...(await loadTagGroups(job)) };
 };
-
-
 
 // same shape as getPendingJobs.
 const attachPosterInfo = async (jobs) => {
@@ -129,25 +115,36 @@ const attachPosterInfo = async (jobs) => {
   });
 };
 // ─── Helper: sync requirements_tags rows for a job ───────────────────────────
-const syncRequirementsTags = async (jobId, requirements) => {
-  await supabase.from("requirements_tags").delete().eq("job_id", jobId);
+// ─── Helper: sync tag rows (requirements OR responsibilities) ────────────────
+const syncTagRows = async (table, jobId, groups) => {
+  await supabase.from(table).delete().eq("job_id", jobId);
+  if (!Array.isArray(groups) || groups.length === 0) return;
 
-  if (!requirements || requirements.length === 0) return;
-
-  const rows = requirements
-    .filter(g => g.tag?.trim() && Array.isArray(g.items) && g.items.length > 0)
+  const rows = groups
+    .filter(g => g?.tag?.trim() && Array.isArray(g.items) && g.items.some(i => String(i).trim()))
     .map((g, i) => ({
       job_id: jobId,
       tag: g.tag.trim(),
-      items: g.items.filter(Boolean),
+      items: g.items.map(i => String(i).trim()).filter(Boolean),
       sort_order: i,
     }));
 
   if (rows.length > 0) {
-    await supabase.from("requirements_tags").insert(rows);
+    const { error } = await supabase.from(table).insert(rows);
+    if (error) throw error;
   }
 };
 
+const syncRequirementsTags = (jobId, requirements) =>
+  syncTagRows("requirements_tags", jobId, requirements);
+const syncResponsibilitiesTags = (jobId, responsibilities) =>
+  syncTagRows("responsibilities_tags", jobId, responsibilities);
+
+// Normalises old data (plain string array) and new data (tagged groups)
+const toGroups = (tags, legacy) =>
+  tags && tags.length > 0
+    ? tags.map(t => ({ tag: t.tag, items: t.items }))
+    : (legacy || []);
 // ─── Helper: resolve which account (if any) owns a job, for notifications/
 // messaging. A job belongs to whoever `recruiter_email` matches — either a
 // real business/corporate account, or an unclaimed guest recruiter until
@@ -189,25 +186,28 @@ export const getJobs = async (req, res) => {
 
     const jobIds = jobs.map(j => j.id);
 
-    const { data: allTags } = await supabase
-      .from("requirements_tags")
-      .select("*")
-      .in("job_id", jobIds)
-      .order("sort_order");
+    const [{ data: allReqTags }, { data: allRespTags }] = await Promise.all([
+      supabase.from("requirements_tags").select("*").in("job_id", jobIds).order("sort_order"),
+      supabase.from("responsibilities_tags").select("*").in("job_id", jobIds).order("sort_order"),
+    ]);
 
-    const tagsByJob = {};
-    (allTags || []).forEach(t => {
-      if (!tagsByJob[t.job_id]) tagsByJob[t.job_id] = [];
-      tagsByJob[t.job_id].push({ tag: t.tag, items: t.items });
-    });
+    const groupByJob = (rows) => {
+      const map = {};
+      (rows || []).forEach(t => {
+        if (!map[t.job_id]) map[t.job_id] = [];
+        map[t.job_id].push({ tag: t.tag, items: t.items });
+      });
+      return map;
+    };
+    const reqByJob = groupByJob(allReqTags);
+    const respByJob = groupByJob(allRespTags);
 
     const withPoster = await attachPosterInfo(jobs);
 
     const result = withPoster.map(job => ({
       ...job,
-      requirements: tagsByJob[job.id]?.length > 0
-        ? tagsByJob[job.id]
-        : (job.requirements || []),
+      requirements: reqByJob[job.id]?.length > 0 ? reqByJob[job.id] : (job.requirements || []),
+      responsibilities: respByJob[job.id]?.length > 0 ? respByJob[job.id] : (job.responsibilities || []),
     }));
 
     res.json({ success: true, data: result });
@@ -215,7 +215,6 @@ export const getJobs = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
 // ─── GET JOB BY ID or SLUG ────────────────────────────────────────────────────
 export const getJobById = async (req, res) => {
   try {
@@ -316,7 +315,7 @@ export const createJob = async (req, res) => {
         work_type,
         description,
         requirements: [],
-        responsibilities,
+        responsibilities: [],
         benefits,
         salary_min, salary_max, salary_currency,
         ...applyFields(req.body),
@@ -329,7 +328,7 @@ export const createJob = async (req, res) => {
     if (error) throw error;
 
     await syncRequirementsTags(data.id, requirements);
-
+    await syncResponsibilitiesTags(data.id, responsibilities);   // ← add
     const full = await getFullJob(data.id);
     res.json({ success: true, data: full });
   } catch (err) {
@@ -376,7 +375,7 @@ export const updateJob = async (req, res) => {
         work_type,
         description,
         requirements: [],
-        responsibilities,
+          responsibilities: [], 
         benefits,
         salary_min, salary_max, salary_currency,
         ...applyFields(req.body),
@@ -387,7 +386,8 @@ export const updateJob = async (req, res) => {
 
     if (error) throw error;
 
-    await syncRequirementsTags(id, requirements);
+      await syncRequirementsTags(id, requirements);
+    await syncResponsibilitiesTags(id, responsibilities);
 
     const full = await getFullJob(id);
     res.json({ success: true, message: "Job updated successfully", data: full });
@@ -1451,8 +1451,8 @@ export const saveAdminDraft = async (req, res) => {
       work_type: ["formal", "informal"].includes(work_type) ? work_type : "formal",
       description: description || null,
       requirements: [],
-      responsibilities: responsibilities || [],
-      benefits: benefits || [],
+      responsibilities: [],
+    benefits: benefits || [],
       salary_min: salary_min ?? null,
       salary_max: salary_max ?? null,
       salary_currency: salary_currency || "NGN",
@@ -1472,9 +1472,9 @@ export const saveAdminDraft = async (req, res) => {
       : supabase.from("jobs").insert([row]);
     const { data, error } = await q.select().single();
     if (error) throw error;
-
-    await syncRequirementsTags(data.id, requirements);
-
+await syncRequirementsTags(data.id, requirements);
+    await syncResponsibilitiesTags(data.id, responsibilities);
+    
     res.status(existing ? 200 : 201).json({ success: true, data: await getFullJob(data.id), message: "Draft saved" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1515,7 +1515,8 @@ export const deleteAdminDraft = async (req, res) => {
     const draft = await loadDraft(req.params.id);
     if (!draft) return res.status(404).json({ success: false, message: "Draft not found" });
 
-    await supabase.from("requirements_tags").delete().eq("job_id", draft.id);
+      await supabase.from("requirements_tags").delete().eq("job_id", draft.id);
+    await supabase.from("responsibilities_tags").delete().eq("job_id", draft.id);
     const { error } = await supabase.from("jobs").delete().eq("id", draft.id);
     if (error) throw error;
     res.json({ success: true, message: "Draft deleted" });
