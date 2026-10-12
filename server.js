@@ -32,6 +32,8 @@ import seekerNotificationRoutes from "./route/seekerNotificationRoutes.js"; // j
 import cronRoutes from "./route/cronRoutes.js";
 import referralRoutes from "./route/Referral.routes.js";
 import agentRoutes from "./route/agent.routes.js";
+import verifyRouter from "./route/verify.js";
+
 
 dotenv.config();
 
@@ -110,6 +112,7 @@ app.use("/api", applicationsRoutes);
 app.use("/api", profileViewRoutes);
 app.use(syncUserRoutes);
 app.use("/api", recruiterHubRoutes);
+app.use("/api", verifyRouter); // → POST /api/verify
 
 // ── Misc / health ─────────────────────────────────────────────────────
 app.get("/", (req, res) => {

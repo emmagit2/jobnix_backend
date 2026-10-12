@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+ import { v4 as uuidv4 } from "uuid";
 import { supabase } from "../config/supabase.js";
 import { trackJobClick, getAllClicks } from "../services/analytics.service.js";
 import { isBot } from "../utils/botDetector.js";
@@ -26,8 +26,18 @@ const NG_STATES = {
   OY: "Oyo", PL: "Plateau", RI: "Rivers", SO: "Sokoto", TA: "Taraba",
   YO: "Yobe", ZA: "Zamfara",
 };
+
 const stateName = (country, region) =>
   region ? (country === "NG" ? NG_STATES[region] || region : region) : null;
+
+// Turns a country code ("NG") into its name ("Nigeria").
+const countryNames = (() => {
+  try { return new Intl.DisplayNames(["en"], { type: "region" }); } catch { return null; }
+})();
+const countryName = (code) => {
+  if (!code) return null;
+  try { return countryNames?.of(code) || code; } catch { return code; }
+};
 
 // Click tracking is a PUBLIC route (no requireAuth middleware) — logged-out
 // visitors must still be able to POST. So auth here is OPTIONAL: if a valid
@@ -189,25 +199,28 @@ export const analyticsOverviewController = async (req, res) => {
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => b.count - a.count);
 
-    // ── Visitor locations: where the PEOPLE are (from IP), 1 count per
-    // visitor. Different from topLocations above, which is where the JOBS are.
-    // Every location people visited from, across ALL users. For each place:
+    // ── Visitor locations: where the PEOPLE are (from IP), NOT where the jobs
+    // are (that's topLocations above). Every place people visited from, across
+    // ALL users. For each place:
     //   visitors = how many different people were there
     //   visits   = how many total clicks came from there
-    // Returned two ways: by city (with its state + country) and by state.
-    const cityMap  = {};
-    const stateMap = {};
+    // Returned three ways: by city (with its state + country), by state,
+    // and by country. Nothing is capped.
+    const cityMap    = {};
+    const stateMap   = {};
+    const countryMap = {};
     const bump = (map, key, meta, c) => {
       if (!map[key]) map[key] = { ...meta, visits: 0, people: new Set() };
       map[key].visits++;
       if (c.visitor_id) map[key].people.add(c.visitor_id);
     };
     clicks.forEach((c) => {
-      const country = c.visitor_country || "Unknown";
+      const country = countryName(c.visitor_country) || "Unknown";
       const state   = stateName(c.visitor_country, c.visitor_region) || "Unknown";
       const city    = c.visitor_city || "Unknown";
-      bump(cityMap,  `${country}|${state}|${city}`, { country, state, city }, c);
-      bump(stateMap, `${country}|${state}`,         { country, state },       c);
+      bump(cityMap,    `${country}|${state}|${city}`, { country, state, city }, c);
+      bump(stateMap,   `${country}|${state}`,         { country, state },       c);
+      bump(countryMap, country,                       { country },              c);
     });
     const finalize = (map) =>
       Object.values(map)
@@ -215,6 +228,7 @@ export const analyticsOverviewController = async (req, res) => {
         .sort((a, b) => b.visitors - a.visitors || b.visits - a.visits);
     const visitorLocations = finalize(cityMap);
     const visitorStates    = finalize(stateMap);
+    const visitorCountries = finalize(countryMap);
 
     // ── Visitors: unique + returning vs new
     // "Returning" = visitor_id seen on 2+ distinct calendar days (UTC).
@@ -274,6 +288,7 @@ export const analyticsOverviewController = async (req, res) => {
         topReferrers,
         visitorLocations,
         visitorStates,
+        visitorCountries,
         clicksOverTime,
         returningUsers: returning,
         newUsers:       newVisitors,
