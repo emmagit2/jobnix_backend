@@ -562,31 +562,42 @@ export const saveMyCv = async (req, res) => {
 // (lib/emailTemplates.js) imported at the top of this file.
 // ═══════════════════════════════════════════════════════════════════════════
 
- const CV_BUCKET = "cvs"; // 👈 change to your real bucket name
+ const CV_BUCKET = "cvs";
+const COVER_BUCKET = "cover-letters";
 
-async function fetchCvAttachment(cvPath, applicantName) {
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const COVER_EXTS = ["pdf", "docx", "doc", "txt"];
+
+async function fetchAttachment(bucket, path, applicantName, label, fallbackExt = "pdf") {
   try {
-    const { data: blob, error } = await supabase.storage.from(CV_BUCKET).download(cvPath);
+    const { data: blob, error } = await supabase.storage.from(bucket).download(path);
     if (error || !blob) return null;
 
     const buf = Buffer.from(await blob.arrayBuffer());
-    if (buf.length > 5 * 1024 * 1024) return null; // skip attaching CVs over 5 MB
-    const ext = (cvPath.split(".").pop() || "pdf").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || "pdf";
+    if (buf.length > MAX_ATTACHMENT_BYTES) return null;
+
+    const ext = (path.split(".").pop() || fallbackExt).toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 5) || fallbackExt;
     const safeName = applicantName.replace(/[^a-z0-9]+/gi, "_").replace(/^_|_$/g, "") || "Applicant";
-    return { filename: `${safeName}_CV.${ext}`, content: buf };
+    return { filename: `${safeName}_${label}.${ext}`, content: buf };
   } catch {
     return null;
   }
 }
 
+const fetchCvAttachment = (path, name) => fetchAttachment(CV_BUCKET, path, name, "CV");
+const fetchCoverLetterAttachment = (path, name) => fetchAttachment(COVER_BUCKET, path, name, "Cover_Letter");
+  
 export const applyByEmail = async (req, res) => {
   try {
     const { id: jobId } = req.params;
 
-  const { data: job, error: jobErr } = await supabase
-  .from("jobs").select("*").eq("id", jobId).maybeSingle();
-if (jobErr) throw jobErr;
-if (!job || job.status === "draft") return res.status(404).json({ success: false, message: "Job not found" });
+    const { data: job, error: jobErr } = await supabase
+      .from("jobs").select("*").eq("id", jobId).maybeSingle();
+    if (jobErr) throw jobErr;
+    if (!job || job.status === "draft") {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+
     // Recipient always comes from the DB, never from the client
     if (job.apply_method !== "email" || !job.apply_email) {
       return res.status(400).json({ success: false, message: "This job does not accept email applications" });
@@ -607,7 +618,6 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
       .eq("id", req.userId).maybeSingle();
     if (profErr) throw profErr;
 
-
     // Must be acting as a job seeker
     const { data: me } = await supabase.from("profiles").select("account_type").eq("id", req.userId).maybeSingle();
     if (me?.account_type && me.account_type !== "jobseeker") {
@@ -620,17 +630,52 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
     if (job.submitted_by_business_id === req.userId || (myEmail && ownEmails.includes(myEmail))) {
       return res.status(400).json({ success: false, message: "You can't apply to your own job." });
     }
+
     // Need at least a CV or a public profile to send the employer
     if (!profile?.cv_url && !profile?.username) {
       return res.status(400).json({ success: false, code: "NO_CV", message: "Upload your CV to your profile first" });
+    }
+
+    // ── Cover letter input (optional): typed text, a file, or both ──
+    const coverText =
+      typeof req.body.cover_letter_text === "string"
+        ? req.body.cover_letter_text.trim().slice(0, 3000) || null
+        : null;
+
+    const coverPath =
+      typeof req.body.cover_letter_path === "string" && req.body.cover_letter_path
+        ? req.body.cover_letter_path
+        : null;
+
+    // The file must live in the caller's own folder and be an allowed type
+    if (coverPath) {
+      const ext = coverPath.split(".").pop()?.toLowerCase();
+      const inOwnFolder = coverPath.startsWith(`${req.userId}/`) && !coverPath.includes("..");
+      if (!inOwnFolder || !COVER_EXTS.includes(ext)) {
+        return res.status(400).json({
+          success: false,
+          message: "Cover letter must be a PDF, Word (.docx) or text file.",
+        });
+      }
     }
 
     const [withCompany] = await attachPosterInfo([job]);
     const applicantName = profile.full_name || "Applicant";
 
     const attachment = profile.cv_url ? await fetchCvAttachment(profile.cv_url, applicantName) : null;
-    
-        // Signed link for the "View CV" fallback (valid 7 days)
+
+    let coverAttachment = null;
+    if (coverPath) {
+      coverAttachment = await fetchCoverLetterAttachment(coverPath, applicantName);
+      if (!coverAttachment) {
+        return res.status(400).json({
+          success: false,
+          message: "We couldn't read your cover letter file. Please upload it again or skip it.",
+        });
+      }
+    }
+
+    // Signed link for the "View CV" fallback (valid 7 days)
     let cvLink = null;
     if (profile.cv_url) {
       const { data: signed } = await supabase.storage
@@ -638,6 +683,7 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
         .createSignedUrl(profile.cv_url, 60 * 60 * 24 * 7);
       cvLink = signed?.signedUrl || null;
     }
+
     const { subject, html } = candidateApplicationEmail({
       jobTitle: job.title,
       companyName: withCompany.company_name,
@@ -646,8 +692,10 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
       headline: profile.headline,
       cvAttached: !!attachment,
       cvUrl: cvLink,
-       profileUrl: profile.username ? `https://jobnix.ng/u/${profile.username}` : null,
+      profileUrl: profile.username ? `https://jobnix.ng/u/${profile.username}` : null,
       jobUrl: `https://jobnix.ng/jobs/${job.slug || job.id}`,
+      coverLetterText: coverText,
+      coverLetterAttached: !!coverAttachment,
     });
 
     // Send FIRST. If it fails, nothing is recorded and the candidate can retry.
@@ -657,7 +705,7 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
         replyTo: profile.email,
         subject,
         html,
-        attachments: attachment ? [attachment] : [],
+        attachments: [attachment, coverAttachment].filter(Boolean),
       });
     } catch (mailErr) {
       console.error("applyByEmail: send failed:", mailErr.message);
@@ -674,19 +722,30 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
         applicant_id: req.userId,
         method: "email",
         email_sent_to: job.apply_email,
-        email_body: `Application email sent for "${job.title}"${attachment ? " with CV attached" : ""}.`,
+        email_body:
+          `Application email sent for "${job.title}"` +
+          `${attachment ? " with CV attached" : ""}` +
+          `${coverText || coverAttachment ? " and a cover letter" : ""}.`,
+        cover_letter_text: coverText,
+        cover_letter_path: coverPath,
       })
       .select().single();
 
     if (appErr) console.error("applyByEmail: email sent but saving application failed:", appErr.message);
     else await supabase.rpc("increment_job_application", { p_job_id: jobId });
 
-    res.status(201).json({ success: true, data: { cvAttached: !!attachment, application } });
+    res.status(201).json({
+      success: true,
+      data: {
+        cvAttached: !!attachment,
+        coverLetterIncluded: !!(coverText || coverAttachment),
+        application,
+      },
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-
 // ─── JOB STATS (business dashboard): one job's view/click/application card ───
 export const getJobStats = async (req, res) => {
   try {
