@@ -5,12 +5,7 @@ import * as jobsRepo from "../lib/jobsRepo.js";
 import * as businessProfilesRepo from "../lib/businessProfilesRepo.js";
 import * as paystackService from "../services/paystackService.js";
 import { PLANS, PREMIUM_SUBSCRIPTION_FEE_KOBO } from "../config/plans.js";
-
-// business_profiles has no email column of its own — it's a 1:1 extension
-// of profiles (business_profiles.id references profiles.id), and email
-// lives only on profiles. Same lookup jobsController.js already does in
-// getMyJobs/getJobStats/getJobApplicants — reused here so callers never
-// have to know or supply the email themselves.
+ 
 const getBusinessEmail = async (businessId) => {
   const { data, error } = await supabase.from("profiles").select("email").eq("id", businessId).single();
   if (error) throw error;
@@ -131,14 +126,31 @@ export async function initializePremiumUpgrade(req, res) {
 // being redirected), so during local dev this is what actually finalizes
 // the payment. Once you deploy with a public webhook URL, both will fire
 // and agree — no configuration change needed later.
-async function finalizePaymentIfSuccessful(reference) {
+ async function finalizePaymentIfSuccessful(reference) {
   const payment = await paymentsRepo.findByReference(reference);
   if (!payment || payment.status === "success") return payment;
 
   const tx = await paystackService.verifyTransaction(reference);
   if (tx.status !== "success") return payment;
 
+  // What Paystack took must equal what we asked for.
+  if (Number(tx.amount) !== Number(payment.amount_kobo)) {
+    console.error(`Amount mismatch for ${reference}: paid ${tx.amount}, expected ${payment.amount_kobo}`);
+    return payment;
+  }
+
+  // For informal jobs, it must also match the job's CURRENT price.
+  if (payment.purpose === "informal_job") {
+    const { data: job } = await supabase
+      .from("jobs").select("payment_amount").eq("id", payment.job_id).single();
+    if (Math.round(Number(job?.payment_amount) * 100) !== Number(payment.amount_kobo)) {
+      console.error(`Price changed after init for ${reference}: needs manual review/refund`);
+      return payment;
+    }
+  }
+
   const updated = await paymentsRepo.markSuccess(reference, tx);
+  if (!updated) return payment; // another request already processed it
 
   if (updated.purpose === "premium_subscription") {
     await businessProfilesRepo.setPlan(updated.business_id, "premium");

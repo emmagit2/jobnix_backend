@@ -15,7 +15,6 @@ import {
   submitInformalJob,
   updateInformalJob,
   deleteInformalJob,
-  confirmInformalJobPayment,
   getPendingJobs,
   approveJob,
   rejectJob,
@@ -59,7 +58,8 @@ router.get("/analytics", [requireAuth, requireBusinessAccount], getMyInformalJob
 
 // Business (or agent acting for a business) submits an informal job —
 // always lands as status "pending" + payment_status "pending". Never goes
-// live until payment is confirmed AND an admin approves it.
+// live until payment is confirmed (Paystack, via the payments routes) AND
+// an admin approves it.
 router.post("/informal", [requireAuth, requireBusinessAccount], submitInformalJob);
 
 // Business: edit or delete ONE of their own informal jobs. Ownership is
@@ -68,7 +68,7 @@ router.patch("/informal/:id", [requireAuth, requireBusinessAccount], updateInfor
 router.delete("/informal/:id", [requireAuth, requireBusinessAccount], deleteInformalJob);
 
 // Admin queue: informal jobs that are paid and awaiting review.
-router.get("/pending", adminCheck, getPendingJobs);
+router.get("/pending", requireAuth, adminCheck, getPendingJobs);
 
 // Admin drafts — MUST come before any "/:id" route.
 // requireAuth sets req.userId (used for drafted_by / approved_by);
@@ -93,9 +93,9 @@ router.post("/my-cv", requireAuth, saveMyCv);
 router.get("/:id/stats", [requireAuth, requireBusinessAccount], getJobStats);
 router.get("/:id/applicants", [requireAuth, requireBusinessAccount], getJobApplicants);
 
-// Payment webhook callback — should be called by your payment provider's
-// server-to-server webhook, not directly from the client.
-router.post("/:id/confirm-payment", confirmInformalJobPayment);
+// NOTE: payment confirmation is NOT handled here. Paystack's callback and
+// webhook go through the payments routes (paymentController.js), which mark
+// informal jobs as paid via jobsRepo.markInformalJobPaid.
 
 // Generic "/:id" LAST among single-segment GETs.
 router.get("/:id", getJobById);
@@ -115,8 +115,9 @@ router.delete("/:id", adminCheck, deleteJob);
 // TOGGLE FEATURED
 router.patch("/:id/featured", adminCheck, toggleFeaturedJob);
 
-// APPROVE / REJECT an informal job submission
-router.patch("/:id/approve", adminCheck, approveJob);
-router.patch("/:id/reject", adminCheck, rejectJob);
+// APPROVE / REJECT an informal job submission.
+// requireAuth first so req.userId is set (approveJob saves it as approved_by).
+router.patch("/:id/approve", requireAuth, adminCheck, approveJob);
+router.patch("/:id/reject", requireAuth, adminCheck, rejectJob);
 
-export default router; 
+export default router;

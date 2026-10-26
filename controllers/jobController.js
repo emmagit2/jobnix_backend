@@ -1,13 +1,18 @@
-import { supabase } from "../config/supabase.js";
+ import { supabase } from "../config/supabase.js";
 import messagingAdminDB from "../lib/messagingAdminDB.js";
 import * as notificationService from "../services/notificationService.js";
+import * as jobsRepo from "../lib/jobsRepo.js";
 import { PLANS } from "../config/plans.js";
 import { findOrCreateConversation } from "../lib/conversations.js";
 import { sendEmail } from "../lib/email.js";
 import { candidateApplicationEmail } from "../lib/emailTemplates.js";
 
-const INFORMAL_JOB_FEE = 1500; // NGN — flat fee to publish an informal job advert
- const SKILLS_TABLE = "user_skills";
+// Informal job submit / edit / approve / reject / my-jobs live in their own
+// file (plans, workers, one-edit rule, review days given back, decline reasons).
+// Payment is handled by paymentController.js (Paystack), not here.
+export { submitInformalJob, updateInformalJob, approveJob, rejectJob, getMyJobs } from "./informalJobs.controller.js";
+
+const SKILLS_TABLE = "user_skills";
 
 /* ─── Slug generator (no extra package needed) ───────────────────── */
 function generateSlug(title, company, location, shortId) {
@@ -67,7 +72,7 @@ const getFullJobBySlugOrId = async (slugOrId) => {
   return { ...withPoster, ...(await loadTagGroups(job)) };
 };
 
-// same shape as getPendingJobs.
+// Adds company_name / company_logo (and poster for informal jobs) to each job.
 const attachPosterInfo = async (jobs) => {
   const formalIds = jobs
     .filter(j => j.work_type !== "informal" && j.company_id)
@@ -89,8 +94,6 @@ const attachPosterInfo = async (jobs) => {
   if (informalIds.length > 0) {
     const { data } = await supabase
       .from("business_profiles")
-      // ✅ added business_type + address so the informal "Posted By" card
-      // on JobDetail.jsx has something to show beyond name/logo/phone.
       .select("id, business_name, owner_name, logo_url, phone, phone_verified, nin_verified, business_type, address")
       .in("id", [...new Set(informalIds)]);
     businessesById = Object.fromEntries((data || []).map(b => [b.id, b]));
@@ -114,7 +117,7 @@ const attachPosterInfo = async (jobs) => {
     };
   });
 };
-// ─── Helper: sync requirements_tags rows for a job ───────────────────────────
+
 // ─── Helper: sync tag rows (requirements OR responsibilities) ────────────────
 const syncTagRows = async (table, jobId, groups) => {
   await supabase.from(table).delete().eq("job_id", jobId);
@@ -145,11 +148,14 @@ const toGroups = (tags, legacy) =>
   tags && tags.length > 0
     ? tags.map(t => ({ tag: t.tag, items: t.items }))
     : (legacy || []);
-// ─── Helper: resolve which account (if any) owns a job, for notifications/
-// messaging. A job belongs to whoever `recruiter_email` matches — either a
-// real business/corporate account, or an unclaimed guest recruiter until
-// they sign up (mirrors your existing guest-merge flow). ────────────────────
+
+// ─── Helper: resolve which account (if any) owns a job, for notifications and
+// messaging. Informal jobs store their owner directly. Formal jobs belong to
+// whoever `recruiter_email` matches (a business account, or a guest recruiter
+// who has since signed up). ──────────────────────────────────────────────────
 const resolveBusinessIdForJob = async (job) => {
+  if (job.submitted_by_business_id) return job.submitted_by_business_id;
+
   if (!job.recruiter_email) return null;
   const email = job.recruiter_email.toLowerCase();
 
@@ -170,16 +176,14 @@ const resolveBusinessIdForJob = async (job) => {
 };
 
 // ─── GET ALL JOBS ─────────────────────────────────────────────────────────────
-// .eq("status", "approved") keeps pending/rejected informal submissions out
-// of the public listing. Formal/admin/scraped jobs default to "approved"
-// automatically (the migration's column default), so nothing that used to
-// show up here disappears.
+// Only approved jobs that have not ended. Pending/rejected/draft are hidden.
 export const getJobs = async (req, res) => {
   try {
     const { data: jobs, error } = await supabase
       .from("jobs")
       .select("*")
       .eq("status", "approved")
+      .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
       .order("created_date", { ascending: false });
 
     if (error) throw error;
@@ -215,6 +219,7 @@ export const getJobs = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
 // ─── GET JOB BY ID or SLUG ────────────────────────────────────────────────────
 export const getJobById = async (req, res) => {
   try {
@@ -264,6 +269,9 @@ export const createJob = async (req, res) => {
 
     if (!work_type || !["formal", "informal"].includes(work_type)) {
       return res.status(400).json({ success: false, message: "work_type must be 'formal' or 'informal'" });
+    }
+    if (req.businessId && work_type === "informal") {
+      return res.status(403).json({ success: false, message: "Use the informal job form." });
     }
 
     const applyErr = validateApply(req.body);
@@ -328,7 +336,7 @@ export const createJob = async (req, res) => {
     if (error) throw error;
 
     await syncRequirementsTags(data.id, requirements);
-    await syncResponsibilitiesTags(data.id, responsibilities);   // ← add
+    await syncResponsibilitiesTags(data.id, responsibilities);
     const full = await getFullJob(data.id);
     res.json({ success: true, data: full });
   } catch (err) {
@@ -375,7 +383,7 @@ export const updateJob = async (req, res) => {
         work_type,
         description,
         requirements: [],
-          responsibilities: [], 
+        responsibilities: [],
         benefits,
         salary_min, salary_max, salary_currency,
         ...applyFields(req.body),
@@ -386,7 +394,7 @@ export const updateJob = async (req, res) => {
 
     if (error) throw error;
 
-      await syncRequirementsTags(id, requirements);
+    await syncRequirementsTags(id, requirements);
     await syncResponsibilitiesTags(id, responsibilities);
 
     const full = await getFullJob(id);
@@ -430,7 +438,7 @@ export const toggleFeaturedJob = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
- 
+
 export const incrementJobView = async (req, res) => {
   try {
     const { data, error } = await supabase.rpc("increment_job_view", { p_job_id: req.params.id });
@@ -456,16 +464,21 @@ export const incrementJobClick = async (req, res) => {
   }
 };
 
-
 // ─── APPLY (requires a logged-in jobseeker — req.userId from requireAuth) ────
 export const applyToJob = async (req, res) => {
   try {
     const { coverNote } = req.body;
     const { id: jobId } = req.params;
- 
-  const { data: job, error: jobErr } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
-if (jobErr) throw jobErr;
-if (!job || job.status === "draft") return res.status(404).json({ success: false, message: "Job not found" });
+
+    const { data: job, error: jobErr } = await supabase.from("jobs").select("*").eq("id", jobId).maybeSingle();
+    if (jobErr) throw jobErr;
+    if (!job || job.status !== "approved") {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+    if (job.expires_at && new Date(job.expires_at) < new Date()) {
+      return res.status(400).json({ success: false, message: "This job has ended and is no longer accepting applications." });
+    }
+
     const { data: already } = await supabase
       .from("applications")
       .select("id")
@@ -473,45 +486,41 @@ if (!job || job.status === "draft") return res.status(404).json({ success: false
       .eq("applicant_id", req.userId)
       .maybeSingle();
     if (already) return res.status(409).json({ success: false, message: "You've already applied to this job" });
- 
+
     const { data: application, error: appErr } = await supabase
       .from("applications")
       .insert({ job_id: jobId, applicant_id: req.userId, cover_note: coverNote })
       .select()
       .single();
     if (appErr) throw appErr;
- 
+
     await supabase.rpc("increment_job_application", { p_job_id: jobId });
- 
+
     // Non-fatal: the application is already saved, so a messaging/notification
     // problem must not make the applicant see an error.
     try {
       const businessId = await resolveBusinessIdForJob(job);
       // businessId null = job posted by a guest recruiter with no account yet — nothing to notify
       if (businessId) {
-        // Syncs both users into DB2, then finds or creates the conversation
-        // and tags it with this job.
         const { conversationId, applicantName } = await findOrCreateConversation({
           businessId,
           applicantId: req.userId,
           jobId: job.id,
         });
- 
+
         const { error: msgErr } = await messagingAdminDB.from("messages").insert({
           conversation_id: conversationId,
           sender_id: req.userId,
           content: coverNote?.trim() || `${applicantName} applied to "${job.title}".`,
         });
         if (msgErr) throw msgErr;
-        // last_message_at is kept current by your existing
-        // trg_bump_conversation_last_message trigger — no manual update needed.
- 
+
         await notificationService.notifyNewApplicant(businessId, job.title, applicantName);
       }
     } catch (chatErr) {
       console.error("applyToJob: post-apply chat/notify failed:", chatErr.message);
     }
- 
+
     res.status(201).json({ success: true, data: application });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -525,7 +534,7 @@ export const saveMyCv = async (req, res) => {
     const userId = req.userId || req.user?.id;
 
     // The path must live inside the user's own folder in the bucket
-    if (!cvPath || typeof cvPath !== "string" || !cvPath.startsWith(`${userId}/`)) {
+    if (!cvPath || typeof cvPath !== "string" || !cvPath.startsWith(`${userId}/`) || cvPath.includes("..")) {
       return res.status(400).json({ success: false, message: "Invalid CV path" });
     }
 
@@ -554,15 +563,13 @@ export const saveMyCv = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
- 
+
 // ═══════════════════════════════════════════════════════════════════════════
 // APPLY BY EMAIL — server sends the branded email to the job's apply_email,
 // with the applicant's CV attached (or a CV / profile link as a fallback).
-// Needs: sendEmail (lib/email.js) and candidateApplicationEmail
-// (lib/emailTemplates.js) imported at the top of this file.
 // ═══════════════════════════════════════════════════════════════════════════
 
- const CV_BUCKET = "cvs";
+const CV_BUCKET = "cvs";
 const COVER_BUCKET = "cover-letters";
 
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -586,7 +593,7 @@ async function fetchAttachment(bucket, path, applicantName, label, fallbackExt =
 
 const fetchCvAttachment = (path, name) => fetchAttachment(CV_BUCKET, path, name, "CV");
 const fetchCoverLetterAttachment = (path, name) => fetchAttachment(COVER_BUCKET, path, name, "Cover_Letter");
-  
+
 export const applyByEmail = async (req, res) => {
   try {
     const { id: jobId } = req.params;
@@ -594,8 +601,11 @@ export const applyByEmail = async (req, res) => {
     const { data: job, error: jobErr } = await supabase
       .from("jobs").select("*").eq("id", jobId).maybeSingle();
     if (jobErr) throw jobErr;
-    if (!job || job.status === "draft") {
+    if (!job || job.status !== "approved") {
       return res.status(404).json({ success: false, message: "Job not found" });
+    }
+    if (job.expires_at && new Date(job.expires_at) < new Date()) {
+      return res.status(400).json({ success: false, message: "This job has ended and is no longer accepting applications." });
     }
 
     // Recipient always comes from the DB, never from the client
@@ -611,7 +621,7 @@ export const applyByEmail = async (req, res) => {
       .eq("job_id", jobId).eq("applicant_id", req.userId).maybeSingle();
     if (already) return res.status(409).json({ success: false, message: "You've already applied to this job" });
 
-    // ⚠️ "username" = the column behind jobnix.ng/u/<username>. Rename if yours differs.
+    // "username" = the column behind jobnix.ng/u/<username>. Rename if yours differs.
     const { data: profile, error: profErr } = await supabase
       .from("user_profiles")
       .select("full_name, email, cv_url, headline, username")
@@ -746,23 +756,14 @@ export const applyByEmail = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
 // ─── JOB STATS (business dashboard): one job's view/click/application card ───
+// Ownership comes from jobsRepo.findByIdForBusiness, which handles both
+// informal jobs (submitted_by_business_id) and formal jobs (recruiter_email).
 export const getJobStats = async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const { data: me, error: meErr } = await supabase.from("profiles").select("email").eq("id", req.businessId).single();
-    if (meErr) throw meErr;
-
-    const { data: job, error } = await supabase
-      .from("jobs")
-      .select("title, recruiter_email, view_count, click_count, application_count")
-      .eq("id", id)
-      .maybeSingle();
-    if (error) throw error;
-    if (!job || (job.recruiter_email || "").toLowerCase() !== (me.email || "").toLowerCase()) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
+    const job = await jobsRepo.findByIdForBusiness(req.params.id, req.businessId);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
     res.json({
       success: true,
@@ -779,25 +780,12 @@ export const getJobStats = async (req, res) => {
 };
 
 // ─── APPLICANTS (business dashboard): who applied to one of my jobs ──────────
-// Confirms the requester owns this job (same recruiter_email check as
-// getJobStats), then returns every application with the applicant's
-// name/email/CV attached.
 export const getJobApplicants = async (req, res) => {
   try {
     const { id } = req.params;
 
-    const { data: me, error: meErr } = await supabase.from("profiles").select("email").eq("id", req.businessId).single();
-    if (meErr) throw meErr;
-
-    const { data: job, error: jobErr } = await supabase
-      .from("jobs")
-      .select("id, title, recruiter_email")
-      .eq("id", id)
-      .maybeSingle();
-    if (jobErr) throw jobErr;
-    if (!job || (job.recruiter_email || "").toLowerCase() !== (me.email || "").toLowerCase()) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
+    const job = await jobsRepo.findByIdForBusiness(id, req.businessId);
+    if (!job) return res.status(404).json({ success: false, message: "Job not found" });
 
     const { data: applications, error: appsErr } = await supabase
       .from("applications")
@@ -825,117 +813,7 @@ export const getJobApplicants = async (req, res) => {
   }
 };
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Informal job submission (business/agent), admin approval queue, and
-// payment confirmation. Needs jobs_approval_agent_payment_migration.sql run
-// first (adds status, submitted_by_business_id, approved_by/approved_at,
-// posted_by_type, agent_name/agent_phone, agent_liability_accepted(+at),
-// payment_status/payment_amount/payment_reference/paid_at to "jobs").
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ─── CREATE INFORMAL JOB (business or agent submits — goes to "pending") ─────
-// Separate from createJob (which stays as-is for formal/admin/scraped jobs).
-// A business's informal submission is NEVER auto-approved and NEVER goes
-// live before payment is confirmed AND an admin approves it.
-export const submitInformalJob = async (req, res) => {
-  try {
-    const {
-      title, location, role_category, description, responsibilities, benefits,
-      salary_min, salary_max, salary_currency,
-      deadline,
-      postAs, // 'owner' | 'agent'
-      agent_name, agent_phone, // only meaningful when postAs === 'agent'
-    } = req.body;
-
-    if (!req.businessId) {
-      return res.status(401).json({ success: false, message: "Must be logged in as a business to submit a job" });
-    }
-
-    const isAgent = postAs === "agent";
-    if (isAgent && (!agent_name || !agent_phone)) {
-      return res.status(400).json({ success: false, message: "Agent name and phone are required when posting as an agent" });
-    }
-
-    const shortId = Math.random().toString(36).slice(2, 8);
-    const slug = generateSlug(title, "", location, shortId);
-
-    const { data, error } = await supabase
-      .from("jobs")
-      .insert([{
-        title, location, role_category,
-        work_type: "informal",
-        job_type: "Full-time",
-        description,
-        requirements: [],
-        responsibilities: responsibilities || [],
-        benefits: benefits || [],
-        salary_min, salary_max, salary_currency,
-
-        // Informal jobs are always one-click. These are set here on the
-        // server so the client can't send anything else.
-        apply_method: "platform",
-        apply_link: null,
-        apply_email: null,
-        how_to_apply: null,
-        recruiter_email: null,
-        deadline,
-        slug,
-
-        // Approval — pending until admin reviews
-        status: "pending",
-        submitted_by_business_id: req.businessId,
-
-        // Agent
-        posted_by_type: isAgent ? "agent" : "owner",
-        agent_name: isAgent ? agent_name : null,
-        agent_phone: isAgent ? agent_phone : null,
-        agent_liability_accepted: isAgent,
-        agent_liability_accepted_at: isAgent ? new Date().toISOString() : null,
-
-        // Payment — required before the job can go live
-        payment_status: "pending",
-        payment_amount: INFORMAL_JOB_FEE,
-        payment_currency: "NGN",
-      }])
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json({ success: true, data, message: "Job submitted — pending approval and payment." });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ─── CONFIRM PAYMENT (call from your payment provider's webhook, not the client) ─
-// ⚠️ This route currently has no signature/auth check in the router file —
-// lock it down with your provider's webhook signature verification before
-// going live, or anyone who knows a job's id could call it and fake a paid
-// status without actually paying.
-export const confirmInformalJobPayment = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { paymentReference } = req.body;
-
-    const { data, error } = await supabase
-      .from("jobs")
-      .update({
-        payment_status: "paid",
-        payment_reference: paymentReference,
-        paid_at: new Date().toISOString(),
-      })
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) throw error;
-
-    res.json({ success: true, data, message: "Payment confirmed — job is now awaiting admin approval." });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ─── ADMIN: LIST PENDING INFORMAL JOBS ───────────────────────────────────────
+// ─── ADMIN: INFORMAL JOBS WAITING FOR REVIEW (paid, status pending) ──────────
 export const getPendingJobs = async (req, res) => {
   try {
     const { data: jobs, error } = await supabase
@@ -944,157 +822,45 @@ export const getPendingJobs = async (req, res) => {
       .eq("work_type", "informal")
       .eq("status", "pending")
       .eq("payment_status", "paid")
-      .order("created_date", { ascending: true });
-
+      .order("created_date", { ascending: true }); // oldest first, so nobody waits longest
     if (error) throw error;
 
-    const businessIds = [...new Set(jobs.map(j => j.submitted_by_business_id).filter(Boolean))];
-    let posterById = {};
-    if (businessIds.length > 0) {
-      const { data: businesses, error: bizErr } = await supabase
-        .from("business_profiles")
-        .select("id, business_name, owner_name, phone, phone_verified, nin_verified, logo_url")
-        .in("id", businessIds);
-      if (bizErr) throw bizErr;
-      posterById = Object.fromEntries(businesses.map(b => [b.id, b]));
-    }
-
-    const data = jobs.map(job => ({
-      ...job,
-      poster: posterById[job.submitted_by_business_id] || null,
-    }));
-
-    res.json({ success: true, data });
+    res.json({ success: true, data: await attachPosterInfo(jobs || []) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
 
-// ─── ADMIN: APPROVE ───────────────────────────────────────────────────────────
-export const approveJob = async (req, res) => {
+// ─── BUSINESS: DELETE MY OWN INFORMAL JOB ────────────────────────────────────
+// Allowed when no money would be lost: never paid, rejected, or already ended.
+// A paid job that is still running cannot be deleted.
+export const deleteInformalJob = async (req, res) => {
   try {
     const { id } = req.params;
 
     const { data: job, error: fetchErr } = await supabase
       .from("jobs")
-      .select("title, payment_status, submitted_by_business_id")
+      .select("id, work_type, submitted_by_business_id, status, payment_status, expires_at")
       .eq("id", id)
-      .single();
+      .maybeSingle();
     if (fetchErr) throw fetchErr;
 
-    if (job.payment_status !== "paid") {
-      return res.status(400).json({ success: false, message: "Cannot approve a job that hasn't been paid for" });
+    // 404 rather than 403 so we don't reveal that the job exists
+    if (!job || job.work_type !== "informal" || job.submitted_by_business_id !== req.businessId) {
+      return res.status(404).json({ success: false, message: "Job not found" });
     }
 
-    const { data, error } = await supabase
-      .from("jobs")
-      .update({
-        status: "approved",
-        approved_by: req.userId,
-        approved_at: new Date().toISOString(),
-      })
-      .eq("id", id)
-      .select()
-      .single();
+    const ended = job.expires_at && new Date(job.expires_at).getTime() <= Date.now();
+    if (job.payment_status === "paid" && job.status !== "rejected" && !ended) {
+      return res.status(403).json({
+        success: false,
+        message: "This job is paid for and still running, so it can't be deleted. It will end on its own date.",
+      });
+    }
+
+    const { error } = await supabase.from("jobs").delete().eq("id", id);
     if (error) throw error;
-
-    // ⬇️ Mark any pending referral commission tied to this job as paid,
-    // now that the job it was earned from has actually been approved —
-    // then notify the referrer that they've earned a confirmed commission.
-    try {
-      const { data: paidRows, error: refErr } = await supabase
-        .from("referral_earnings")
-        .update({ status: "paid", paid_at: new Date().toISOString() })
-        .eq("job_id", id)
-        .eq("status", "pending")
-        .select("referrer_business_id, commission_amount, currency, referred_business_id");
-      if (refErr) throw refErr;
-
-      for (const row of paidRows || []) {
-        const { data: referredBiz } = await supabase
-          .from("business_profiles")
-          .select("business_name")
-          .eq("id", row.referred_business_id)
-          .maybeSingle();
-
-        if (typeof notificationService.notifyReferralCommissionEarned === "function") {
-          await notificationService.notifyReferralCommissionEarned(
-            row.referrer_business_id,
-            referredBiz?.business_name || "a referred business",
-            row.commission_amount,
-            row.currency
-          );
-        }
-      }
-    } catch (refErr) {
-      console.error("referral_earnings update/notify failed (non-fatal):", refErr.message);
-    }
-
-    // Notifications not wired up yet — don't let a missing/broken notifier
-    // block the actual approval. Remove this try/catch once
-    // notifyJobApproved is implemented and tested.
-    if (job.submitted_by_business_id && typeof notificationService.notifyJobApproved === "function") {
-      try {
-        await notificationService.notifyJobApproved(job.submitted_by_business_id, job.title);
-      } catch (notifyErr) {
-        console.error("notifyJobApproved failed (non-fatal):", notifyErr.message);
-      }
-    }
-
-    res.json({ success: true, data, message: "Job approved and now live" });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ─── ADMIN: REJECT ────────────────────────────────────────────────────────────
-export const rejectJob = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reason } = req.body;
-
-    const { data: job, error: fetchErr } = await supabase
-      .from("jobs")
-      .select("title, submitted_by_business_id")
-      .eq("id", id)
-      .single();
-    if (fetchErr) throw fetchErr;
-
-    const { data, error } = await supabase
-      .from("jobs")
-      .update({ status: "rejected", rejection_reason: reason || null })
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) throw error;
-
-    if (job.submitted_by_business_id && typeof notificationService.notifyJobRejected === "function") {
-      try {
-        await notificationService.notifyJobRejected(job.submitted_by_business_id, job.title, reason || null);
-      } catch (notifyErr) {
-        console.error("notifyJobRejected failed (non-fatal):", notifyErr.message);
-      }
-    }
-
-    res.json({ success: true, data, message: "Job rejected" });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-export const getMyJobs = async (req, res) => {
-  try {
-    const { data: me, error: meErr } = await supabase.from("profiles").select("email").eq("id", req.businessId).single();
-    if (meErr) throw meErr;
-
-    const { data, error } = await supabase
-      .from("jobs")
-      .select("*, companies(id, name, logo_url)")
-      .or(`recruiter_email.ilike.${me.email},submitted_by_business_id.eq.${req.businessId}`)
-      .order("created_date", { ascending: false });
-    if (error) throw error;
-
-    res.json({ success: true, data });
+    res.json({ success: true, message: "Job deleted" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -1118,7 +884,6 @@ const parseJsonValue = (v, fallback) => {
 const cleanText = (v) => (v == null ? "" : String(v).trim());
 
 // user_skills.trade (jsonb) -> [{ trade, organisation, location, service_area, years }]
-// This is the only skills info sent for informal applicants.
 const toTradeList = (raw) => {
   const list = parseJsonValue(raw, []);
   if (!Array.isArray(list)) return [];
@@ -1134,11 +899,9 @@ const toTradeList = (raw) => {
 };
 
 // ─── All applicants across MY informal jobs ──────────────────────────────────
-// Returns the job (title, location), when they applied, where they said they
-// were when they applied, their work status, and their trade (from
-// user_skills.trade). Phone, email, CV, headline, roles and the technical /
-// soft skill lists are deliberately NOT sent, so businesses reach applicants
-// through in-app Messages only.
+// Phone, email, CV, headline, roles and the technical / soft skill lists are
+// deliberately NOT sent, so businesses reach applicants through in-app
+// Messages only.
 export const getMyInformalApplicants = async (req, res) => {
   try {
     const { data: jobs, error: jobsErr } = await supabase
@@ -1211,7 +974,7 @@ export const getMyInformalApplicants = async (req, res) => {
         applicant_avatar: p?.avatar_url || null,
         applicant_location: p?.location || null, // where they LIVE (profile)
         job_locations: p?.job_locations || [],   // "Can work in"
-        employment_status: p?.employment_status || null, // looking / full_time / part_time
+        employment_status: p?.employment_status || null,
 
         // from user_skills.trade
         trades: toTradeList(skills?.trade),
@@ -1255,8 +1018,6 @@ export const updateApplicantStatus = async (req, res) => {
 };
 
 // ─── Open (or create) the in-app chat with one applicant ─────────────────────
-// Same conversation pattern applyToJob uses: one conversation per pair of
-// people, tagged with the job it started from.
 export const openApplicantChat = async (req, res) => {
   try {
     const { applicationId } = req.params;
@@ -1283,23 +1044,10 @@ export const openApplicantChat = async (req, res) => {
     res.status(500).json({ success: false, message: err.message });
   }
 };
-// ═══════════════════════════════════════════════════════════════════════════
-// ADD THIS to controllers/jobs.controller.js — new export, nothing else in
-// that file needs to change. Place it near getMyInformalApplicants, since it
-// uses the exact same ownership check.
-//
-// Informal-jobs-only: ownership here is submitted_by_business_id alone —
-// same as getMyInformalApplicants. Formal jobs are NOT included.
-// ═══════════════════════════════════════════════════════════════════════════
 
 // ─── BUSINESS DASHBOARD: analytics for MY informal jobs ──────────────────────
 // Views/clicks/applications per job, plus where applicants said they were
-// when they applied (applications.applicant_location — captured only for
-// informal jobs; see createApplication in applications.controller.js).
-// Jobnix doesn't track page-view geography per business (that only exists
-// platform-wide, in the admin dashboard's separate click-tracking table), so
-// this reports "applicants by area", not "views by area" — accurate to what
-// the data actually is.
+// when they applied (applications.applicant_location).
 export const getMyInformalJobsAnalytics = async (req, res) => {
   try {
     const { data: jobs, error: jobsErr } = await supabase
@@ -1354,115 +1102,9 @@ export const getMyInformalJobsAnalytics = async (req, res) => {
   }
 };
 
-// ─── BUSINESS: EDIT MY INFORMAL JOB ───────────────────────────────────────────
-// Ownership check mirrors getMyInformalApplicants — submitted_by_business_id
-// must match the caller. If the job had already been approved and is live,
-// editing it pushes it back to "pending" and clears approval — so a business
-// can't silently swap in different content after admin sign-off. If you'd
-// rather approved jobs stay live through an edit, drop the status/approved_by
-// reset below.
-export const updateInformalJob = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const {
-      title, location, role_category, description, responsibilities, benefits,
-      salary_min, salary_max, salary_currency, deadline,
-      postAs, agent_name, agent_phone,
-    } = req.body;
-
-    if (!req.businessId) {
-      return res.status(401).json({ success: false, message: "Must be logged in as a business" });
-    }
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from("jobs")
-      .select("id, work_type, submitted_by_business_id, status, slug")
-      .eq("id", id)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-
-    // 404 rather than 403 so we don't reveal that the job exists
-    if (!existing || existing.work_type !== "informal" || existing.submitted_by_business_id !== req.businessId) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
-
-    const isAgent = postAs === "agent";
-    if (isAgent && (!agent_name || !agent_phone)) {
-      return res.status(400).json({ success: false, message: "Agent name and phone are required when posting as an agent" });
-    }
-
-    // Keep the same slug suffix, regenerate the readable part in case
-    // title/location changed.
-    const existingShortId = existing.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
-    const slug = generateSlug(title, "", location, existingShortId);
-
-    const wasApproved = existing.status === "approved";
-
-    const { data, error } = await supabase
-      .from("jobs")
-      .update({
-        title, location, role_category, description,
-        responsibilities: responsibilities || [],
-        benefits: benefits || [],
-        salary_min, salary_max, salary_currency,
-        deadline,
-        slug,
-
-        posted_by_type: isAgent ? "agent" : "owner",
-        agent_name: isAgent ? agent_name : null,
-        agent_phone: isAgent ? agent_phone : null,
-        agent_liability_accepted: isAgent ? true : existing.agent_liability_accepted,
-
-        // Force re-review if this was already live — see comment above.
-        ...(wasApproved ? { status: "pending", approved_by: null, approved_at: null } : {}),
-      })
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) throw error;
-
-    res.json({
-      success: true,
-      data,
-      message: wasApproved
-        ? "Job updated — since it was already live, it's back in the review queue."
-        : "Job updated.",
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
-// ─── BUSINESS: DELETE MY INFORMAL JOB ─────────────────────────────────────────
-export const deleteInformalJob = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!req.businessId) {
-      return res.status(401).json({ success: false, message: "Must be logged in as a business" });
-    }
-
-    const { data: existing, error: fetchErr } = await supabase
-      .from("jobs")
-      .select("id, work_type, submitted_by_business_id")
-      .eq("id", id)
-      .maybeSingle();
-    if (fetchErr) throw fetchErr;
-
-    if (!existing || existing.work_type !== "informal" || existing.submitted_by_business_id !== req.businessId) {
-      return res.status(404).json({ success: false, message: "Job not found" });
-    }
-
-    const { error } = await supabase.from("jobs").delete().eq("id", id);
-    if (error) throw error;
-
-    res.json({ success: true, message: "Job deleted" });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-};
-
- 
+// ═══════════════════════════════════════════════════════════════════════════
+// ADMIN DRAFTS (jobs rows with status "draft"; getJobs never shows them)
+// ═══════════════════════════════════════════════════════════════════════════
 
 const loadDraft = async (id) => {
   const { data } = await supabase.from("jobs").select("*").eq("id", id).maybeSingle();
@@ -1511,7 +1153,7 @@ export const saveAdminDraft = async (req, res) => {
       description: description || null,
       requirements: [],
       responsibilities: [],
-    benefits: benefits || [],
+      benefits: benefits || [],
       salary_min: salary_min ?? null,
       salary_max: salary_max ?? null,
       salary_currency: salary_currency || "NGN",
@@ -1531,9 +1173,10 @@ export const saveAdminDraft = async (req, res) => {
       : supabase.from("jobs").insert([row]);
     const { data, error } = await q.select().single();
     if (error) throw error;
-await syncRequirementsTags(data.id, requirements);
+
+    await syncRequirementsTags(data.id, requirements);
     await syncResponsibilitiesTags(data.id, responsibilities);
-    
+
     res.status(existing ? 200 : 201).json({ success: true, data: await getFullJob(data.id), message: "Draft saved" });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -1574,7 +1217,7 @@ export const deleteAdminDraft = async (req, res) => {
     const draft = await loadDraft(req.params.id);
     if (!draft) return res.status(404).json({ success: false, message: "Draft not found" });
 
-      await supabase.from("requirements_tags").delete().eq("job_id", draft.id);
+    await supabase.from("requirements_tags").delete().eq("job_id", draft.id);
     await supabase.from("responsibilities_tags").delete().eq("job_id", draft.id);
     const { error } = await supabase.from("jobs").delete().eq("id", draft.id);
     if (error) throw error;
@@ -1623,4 +1266,4 @@ export const publishAdminDraft = async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
-};
+}; 
