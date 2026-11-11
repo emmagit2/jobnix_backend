@@ -1,34 +1,45 @@
-// controllers/whatsappController.js
+// controllers/whatsappController.js  (Twilio version, sandbox-safe replies)
+import crypto from "crypto";
+import twilio from "twilio";
 import { supabase } from "../config/supabase.js";
 import * as whatsappService from "../services/whatsappService.js";
 import * as geminiService from "../services/geminiService.js";
 import * as businessProfilesRepo from "../lib/businessProfilesRepo.js";
 
-// Meta calls this once, at setup time, to confirm you own the webhook URL.
-export const verifyWebhook = (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
+// "twiml": replies go back inside the webhook response (works in the Twilio sandbox).
+// "rest":  replies are sent through the Twilio REST API (use with a real WhatsApp sender).
+const REPLY_MODE = process.env.TWILIO_REPLY_MODE || "twiml";
 
-  if (mode === "subscribe" && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
-};
-
-// Meta POSTs every inbound message/status update here.
 export const receiveMessage = async (req, res) => {
+  console.log("[whatsapp] webhook hit:", req.body?.Body);
   const inbound = whatsappService.extractInboundMessage(req.body);
 
-  res.sendStatus(200); // always ack immediately so Meta doesn't retry
-  if (!inbound) return;
+  const outbox = [];
+  let responded = false;
+
+  const respond = () => {
+    if (responded) return;
+    responded = true;
+    if (REPLY_MODE === "twiml") {
+      const twiml = new twilio.twiml.MessagingResponse();
+      outbox.forEach((t) => twiml.message(String(t).slice(0, 1500)));
+      res.type("text/xml").send(twiml.toString());
+    } else {
+      res.type("text/xml").send("<Response/>");
+    }
+  };
+
+  // Queue a reply (twiml mode) or send it right away (rest mode).
+  const reply = async (text) => {
+    if (REPLY_MODE === "twiml") outbox.push(text);
+    else await whatsappService.sendText(inbound.from, text);
+  };
+
+  if (!inbound) return respond();
+  if (REPLY_MODE !== "twiml") respond(); // rest mode: ack immediately
 
   try {
-    // ── 1. Check if this is a pending phone-verification code first ──
-    // A business waiting to verify sent us their code as a plain WhatsApp
-    // text. We match on phone_verification_code, not on phone — the
-    // business hasn't been linked to this wa_id yet at this point, that's
-    // literally what we're establishing here.
+    // ── 1. Pending phone-verification code? ──
     const trimmedText = inbound.text.trim();
     if (trimmedText) {
       const pendingBusiness = await businessProfilesRepo.findByPendingCode(trimmedText);
@@ -45,20 +56,16 @@ export const receiveMessage = async (req, res) => {
 
         if (verifyErr) throw verifyErr;
 
-        await whatsappService.sendText(
-          inbound.from,
-          "✅ Your WhatsApp number is now verified for JobNix. You'll receive applicant messages here."
-        );
+        await reply("✅ Your WhatsApp number is now verified for JobNix. You'll receive applicant messages here.");
         return;
       }
     }
 
-    // ── 2. Not a verification code — treat as a normal business-question message ──
+    // ── 2. Normal business-question message ──
     const business = await businessProfilesRepo.findByPhone(`+${inbound.from}`);
 
     if (!business) {
-      await whatsappService.sendText(
-        inbound.from,
+      await reply(
         "This WhatsApp number isn't linked to a verified JobNix business account yet. " +
           "Please add and verify your phone number from your Business Dashboard settings."
       );
@@ -68,6 +75,7 @@ export const receiveMessage = async (req, res) => {
     const { data: recentRows, error: recentErr } = await supabase
       .from("ai_conversations")
       .select("*")
+      .eq("business_id", business.id)
       .eq("whatsapp_number", inbound.from)
       .order("created_at", { ascending: false })
       .limit(10);
@@ -77,44 +85,36 @@ export const receiveMessage = async (req, res) => {
       .reverse()
       .map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text }] }));
 
-    const reply = await geminiService.answerBusinessQuestion(business.id, inbound.text, history);
+    const answer = await geminiService.answerBusinessQuestion(business.id, inbound.text, history);
 
-    await whatsappService.sendText(inbound.from, reply);
+    await reply(answer);
 
     await supabase
       .from("ai_conversations")
       .insert({ business_id: business.id, whatsapp_number: inbound.from, role: "user", text: inbound.text });
     await supabase
       .from("ai_conversations")
-      .insert({ business_id: business.id, whatsapp_number: inbound.from, role: "assistant", text: reply });
+      .insert({ business_id: business.id, whatsapp_number: inbound.from, role: "assistant", text: answer });
   } catch (err) {
     console.error("[whatsapp] failed to handle inbound message:", err);
-    // Don't let a second WhatsApp send failure crash the process —
-    // this branch already failed once; a nested failure here should
-    // just log, not throw unhandled.
     try {
-      await whatsappService.sendText(
-        inbound.from,
-        "Sorry, something went wrong looking that up. Please try again shortly."
-      );
+      await reply("Sorry, something went wrong looking that up. Please try again shortly.");
     } catch (sendErr) {
-      console.error("[whatsapp] fallback send also failed:", sendErr);
+      console.error("[whatsapp] fallback reply also failed:", sendErr);
     }
+  } finally {
+    respond(); // twiml mode: sends the queued replies back to Twilio now
   }
 };
 
-// Generates a code for the business to SEND to JobNix's WhatsApp number —
-// we do NOT send anything outbound here anymore. This sidesteps the
-// WhatsApp 24-hour session window entirely, since the business messaging
-// us first is what opens that window (and satisfies verification in the
-// same act).
+// Generates a code for the business to SEND to the JobNix WhatsApp number.
 export const requestPhoneVerification = async (req, res) => {
-  const { phone } = req.body; // E.164, e.g. +2348012345678 — kept for display/record only
+  const { phone } = req.body; // E.164, e.g. +2348012345678
   if (!phone || !/^\+\d{8,15}$/.test(phone)) {
     return res.status(400).json({ success: false, message: "phone must be in E.164 format, e.g. +2348012345678" });
   }
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const code = String(crypto.randomInt(100000, 1000000));
 
   const { error } = await supabase
     .from("business_profiles")
@@ -125,14 +125,12 @@ export const requestPhoneVerification = async (req, res) => {
   res.json({
     success: true,
     code,
-    sendToNumber: process.env.WHATSAPP_DISPLAY_NUMBER || "+1 555-677-8913",
+    sendToNumber: process.env.WHATSAPP_DISPLAY_NUMBER || "+14155238886",
+    joinCode: process.env.TWILIO_SANDBOX_JOIN_CODE || null,
   });
 };
 
-// Now just a status check — the actual verification happens inside
-// receiveMessage above when the business's WhatsApp text arrives. The
-// frontend polls this after showing the code, to know when to flip to the
-// "verified" screen.
+// Status check: the frontend polls this after showing the code.
 export const confirmPhoneVerification = async (req, res) => {
   const { data: business, error } = await supabase
     .from("business_profiles")
@@ -142,7 +140,7 @@ export const confirmPhoneVerification = async (req, res) => {
   if (error) return res.status(500).json({ success: false, message: error.message });
 
   if (!business.phone_verified) {
-    return res.status(400).json({ success: false, message: "Not verified yet — send the code via WhatsApp first." });
+    return res.status(400).json({ success: false, message: "Not verified yet. Send the code via WhatsApp first." });
   }
 
   res.json({ success: true, verified: true, phone: business.phone });

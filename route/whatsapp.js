@@ -1,10 +1,9 @@
-// routes/whatsapp.js
+ // route/whatsapp.js  (Twilio version)
 import express from "express";
-import { verifyWhatsappSignature } from "../middleware/verifySignatures.js";
+import twilio from "twilio";
 import requireAuth from "../middleware/requireAuth.js";
 import requireBusinessAccount from "../middleware/requireBusinessAccount.js";
 import {
-  verifyWebhook,
   receiveMessage,
   requestPhoneVerification,
   confirmPhoneVerification,
@@ -12,10 +11,22 @@ import {
 
 const router = express.Router();
 
-router.get("/webhook", verifyWebhook); // Meta's one-time setup handshake
-router.post("/webhook", verifyWhatsappSignature, receiveMessage); // inbound messages
+// Twilio posts inbound WhatsApp messages here as form data (not JSON).
+// twilio.webhook() rejects any request not signed by Twilio.
+// Set TWILIO_SKIP_SIGNATURE=true in .env ONLY for quick local debugging.
+const twilioGuard =
+  process.env.TWILIO_SKIP_SIGNATURE === "true"
+    ? (req, res, next) => next()
+    : twilio.webhook({ protocol: "https" });
 
-// "Connect WhatsApp" dashboard flow — OTP against business_profiles.phone
+router.post(
+  "/webhook",
+  express.urlencoded({ extended: false }),
+  twilioGuard,
+  receiveMessage
+);
+
+// "Connect WhatsApp" dashboard flow
 router.post("/verify/request", [requireAuth, requireBusinessAccount], requestPhoneVerification);
 router.post("/verify/confirm", [requireAuth, requireBusinessAccount], confirmPhoneVerification);
 

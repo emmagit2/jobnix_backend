@@ -47,8 +47,9 @@ const INFORMAL_PLANS = {
 
 // Extra charge by number of workers needed. 1 worker = no extra.
 // 2 or 3 workers = ₦500 on top. Change the numbers here any time.
-const MAX_WORKERS = 3;
-const WORKER_TOPUP = { 1: 0, 2: 500, 3: 500 };
+const MAX_WORKERS = 10;
+const WORKER_EXTRA_FEE = 500;
+const workerTopup = (n) => Math.max(0, n - 1) * WORKER_EXTRA_FEE;
 
 // A live job gets ONE edit, and only in the first 3 days after it went live.
 // After that (or once the edit is used) the business must extend the job or post a new one.
@@ -110,8 +111,8 @@ const readWorkers = (value) => {
 
 // What the business pays: plan price + worker top-up.
 const priceFor = (planId, workers) =>
-  (INFORMAL_PLANS[planId]?.fee ?? 0) + (WORKER_TOPUP[workers] ?? 0);
-
+  (INFORMAL_PLANS[planId]?.fee ?? 0) + workerTopup(workers);
+  
 const formatDate = (d) =>
   new Date(d).toLocaleDateString("en-NG", { day: "numeric", month: "long", year: "numeric" });
 

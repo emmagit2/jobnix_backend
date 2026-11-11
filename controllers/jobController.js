@@ -1,7 +1,7 @@
  import { supabase } from "../config/supabase.js";
 import messagingAdminDB from "../lib/messagingAdminDB.js";
 import * as notificationService from "../services/notificationService.js";
-import * as jobsRepo from "../lib/jobsRepo.js";
+import * as jobsRepo from "../lib/jobsRepo.js"; 
 import { PLANS } from "../config/plans.js";
 import { findOrCreateConversation } from "../lib/conversations.js";
 import { sendEmail } from "../lib/email.js";
