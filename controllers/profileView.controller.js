@@ -1,4 +1,4 @@
- // controllers/profileView.controller.js
+// controllers/profileView.controller.js
 //
 // Public, view-only candidate profile pages. Ways in:
 //   1. UNIQUE LINK — a random 64-char token the jobseeker creates in
@@ -85,6 +85,10 @@ async function buildProfileResponse(profile, cvBase) {
     profile: toPublicProfile(profile),
     has_cv: hasCv,
     cv_visibility: cvVisibility,
+    // The candidate has a CV on file but chose to hide it. We say so (without
+    // sending any file link) so the page can show a "locked" card instead of
+    // silently showing nothing.
+    cv_locked: !!profile.cv_url && cvVisibility === "hidden",
     cv_view_url: hasCv ? cvBase : null,
     cv_download_url: hasCv && cvVisibility === "download" ? `${cvBase}?download=1` : null,
     work_experience: related.workExperience || [],

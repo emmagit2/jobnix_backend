@@ -1,4 +1,4 @@
-// routes/guestMessages.js
+ // routes/guestMessages.js
 import express from 'express';
 import { randomUUID } from 'crypto';
 import { supabase } from "../config/supabase.js";
@@ -7,6 +7,10 @@ import { signGuestConversationToken, verifyGuestConversationToken } from '../lib
 import { sendCandidateNewMessageEmail } from '../lib/resendEmail.js';
 
 const router = express.Router();
+
+// Keeps anything that isn't a UUID out of the .or() filter string below.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Free/personal email providers we don't accept for recruiter outreach.
 // Recruiters must message candidates from a company email address so the
@@ -61,12 +65,19 @@ async function upsertGuest({ email, name, company }) {
 // Company-email-only policy: guests must send from a work email address,
 // not a free/personal provider (gmail, yahoo, outlook, etc). Enforced here
 // server-side — the client-side check is just UX and can be bypassed.
+//
+// Privacy: candidates whose profile is Hidden can't be messaged.
 // -----------------------------------------------------------
 router.post('/api/messages/guest-send', async (req, res) => {
   const { candidateId, name, email, company, content } = req.body;
 
   if (!candidateId || !name?.trim() || !email?.trim() || !content?.trim()) {
     return res.status(400).json({ error: 'candidateId, name, email, and content are required' });
+  }
+
+  // candidateId is used inside a query filter string below, so it must be a UUID.
+  if (!UUID_RE.test(String(candidateId))) {
+    return res.status(400).json({ error: 'Invalid candidate.' });
   }
 
   if (isFreeEmailDomain(email)) {
@@ -78,6 +89,18 @@ router.post('/api/messages/guest-send', async (req, res) => {
   }
 
   try {
+    // The candidate must exist and must not be Hidden. Same answer for both,
+    // so this endpoint can't be used to find out which ids are real.
+    const { data: candidate } = await supabase
+      .from('user_profiles')
+      .select('id, full_name, avatar_url, profile_visibility')
+      .eq('id', candidateId)
+      .maybeSingle();
+
+    if (!candidate || candidate.profile_visibility === 'hidden') {
+      return res.status(404).json({ error: "This candidate can't be messaged." });
+    }
+
     const guest = await upsertGuest({ email, name: name.trim(), company });
 
     // If this email already belongs to a real recruiter account, send as
@@ -92,19 +115,29 @@ router.post('/api/messages/guest-send', async (req, res) => {
       org_name: company ?? null,
     });
 
+    // The conversation row references the candidate in the messaging DB, so
+    // make sure they exist there too (otherwise the insert below can fail).
+    await syncUserToMessagingDB({
+      id: candidate.id,
+      role: 'jobseeker',
+      name: candidate.full_name || 'Candidate',
+      avatar_url: candidate.avatar_url ?? null,
+    });
+
     const { data: existingConvo } = await messagingAdminDB
       .from('conversations')
       .select('id')
       .or(
-        `and(participant_one.eq.${messagingIdentity},participant_two.eq.${candidateId}),and(participant_one.eq.${candidateId},participant_two.eq.${messagingIdentity})`
+        `and(participant_one.eq.${messagingIdentity},participant_two.eq.${candidate.id}),and(participant_one.eq.${candidate.id},participant_two.eq.${messagingIdentity})`
       )
+      .limit(1)
       .maybeSingle();
 
     let conversationId = existingConvo?.id;
     if (!conversationId) {
       const { data: createdConvo, error: createErr } = await messagingAdminDB
         .from('conversations')
-        .insert({ participant_one: messagingIdentity, participant_two: candidateId })
+        .insert({ participant_one: messagingIdentity, participant_two: candidate.id })
         .select('id')
         .single();
       if (createErr) throw createErr;
@@ -121,21 +154,26 @@ router.post('/api/messages/guest-send', async (req, res) => {
       .update({ last_message_at: new Date().toISOString() })
       .eq('id', conversationId);
 
-    // Notify the candidate by email — they may not be checking the app.
-    const { data: candidateProfile } = await supabase
-      .from('profiles')
-      .select('email')
-      .eq('id', candidateId)
-      .maybeSingle();
+    // The message is saved at this point. Emailing the candidate is
+    // best-effort: if it fails, the visitor should still see "sent".
+    try {
+      const { data: candidateProfile } = await supabase
+        .from('profiles')
+        .select('email')
+        .eq('id', candidate.id)
+        .maybeSingle();
 
-    if (candidateProfile?.email) {
-      await sendCandidateNewMessageEmail({
-        to: candidateProfile.email,
-        fromName: guest.name,
-        fromCompany: company ?? null,
-        messagePreview: content.trim(),
-        appUrl: `${process.env.APP_URL}/inbox`,
-      });
+      if (candidateProfile?.email) {
+        await sendCandidateNewMessageEmail({
+          to: candidateProfile.email,
+          fromName: guest.name,
+          fromCompany: company ?? null,
+          messagePreview: content.trim(),
+          appUrl: `${process.env.APP_URL}/inbox`,
+        });
+      }
+    } catch (emailErr) {
+      console.error('[guest-send] message saved, but email to candidate failed:', emailErr?.message || emailErr);
     }
 
     res.json({ ok: true, conversationId });
