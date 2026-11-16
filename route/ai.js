@@ -374,4 +374,91 @@ ${jobDescription}
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Paste this block into routes/ai.js, ABOVE the line `export default router;`
+// (it uses generateJSON, toClientError, router and express that are already
+// defined in that file, so no new imports are needed).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Schema ────────────────────────────────────────────────────────────────
+const RELEVANT_JOBS_SCHEMA = {
+  type: "object",
+  properties: {
+    picks: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          relevance: { type: "string", enum: ["direct", "related"] },
+          reason: { type: "string" },
+        },
+        required: ["id", "relevance", "reason"],
+      },
+    },
+  },
+  required: ["picks"],
+};
+
+// ── POST /relevant-jobs ───────────────────────────────────────────────────
+// JSON body: { cv: <parsed CV / profile object>, jobs: [{ id, title, role_category,
+//              location, skills: [] }], limit: 5 }
+// Gemini picks the jobs that are genuinely relevant to this candidate,
+// including RELATED fields (e.g. a web developer is also a fit for digital
+// marketing because both are online work), and returns them best-first.
+router.post("/relevant-jobs", express.json({ limit: "1mb" }), async (req, res) => {
+  try {
+    const { cv, jobs, limit } = req.body;
+    if (!cv || !Array.isArray(jobs) || jobs.length === 0) {
+      return res.status(400).json({ message: "'cv' (object) and a non-empty 'jobs' (array) are required." });
+    }
+
+    const candidates = jobs.slice(0, 60).map((j) => ({
+      id: String(j.id),
+      title: j.title || "",
+      category: j.role_category || "",
+      location: j.location || "",
+      skills: Array.isArray(j.skills) ? j.skills.slice(0, 8) : [],
+    }));
+    const max = Math.min(Math.max(Number(limit) || 5, 1), 10);
+
+    const prompt = `You are an experienced career advisor for the Nigerian job market.
+From the list of open jobs, choose AT MOST ${max} jobs that are genuinely relevant
+to this candidate, best match first.
+
+Rules:
+- "direct": the job matches the candidate's own role or skills.
+- "related": the job is in a closely related field where their skills clearly
+  transfer. Use real-world judgement. Example: a web developer can also suit
+  digital marketing, SEO, UI/UX or e-commerce roles because they are all
+  online work; an accountant can suit audit or tax roles; a tailor can suit
+  fashion-design work.
+- Do NOT pick a job just to fill the list. If only 2 are relevant, return 2.
+  If none are relevant, return an empty list.
+- Only use ids from the jobs given. Never invent ids.
+- "reason" is one short plain sentence (max 12 words) saying why it fits.
+
+Candidate (JSON):
+${JSON.stringify(cv, null, 2)}
+
+Open jobs (JSON):
+${JSON.stringify(candidates, null, 2)}`;
+
+    const result = await generateJSON(prompt, RELEVANT_JOBS_SCHEMA);
+
+    // Safety: keep only ids we actually sent, remove duplicates, cap the count.
+    const valid = new Set(candidates.map((j) => j.id));
+    const seen = new Set();
+    const picks = (result.picks || [])
+      .filter((p) => valid.has(String(p.id)) && !seen.has(String(p.id)) && seen.add(String(p.id)))
+      .slice(0, max);
+
+    res.json({ success: true, data: picks });
+  } catch (err) {
+    console.error("[/api/ai/relevant-jobs] error:", err);
+    const { status, message } = toClientError(err);
+    res.status(status).json({ message });
+  }
+});
+
 export default router;
