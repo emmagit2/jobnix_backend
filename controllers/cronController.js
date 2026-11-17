@@ -2,6 +2,7 @@
 import { supabase } from "../config/supabase.js";
 import * as jobsRepo from "../lib/jobsRepo.js";
 import * as notificationService from "../services/notificationService.js";
+import * as jobAlertService from "../services/jobAlertService.js";
 
 // External scheduler hits this every few hours.
 // POST /api/cron/check-expiring-jobs   header: x-cron-secret: <CRON_SECRET>
@@ -61,6 +62,41 @@ export async function sendWeeklySummaries(req, res) {
     res.json({ sent });
   } catch (err) {
     console.error("[/api/cron/send-weekly-summaries] error:", err);
+    res.status(500).json({ success: false, message: err.message || "Something went wrong." });
+  }
+}
+
+// Job match emails for job seekers.
+// POST /api/cron/send-job-alerts?frequency=instant|daily|weekly|monthly
+//   header: x-cron-secret: <CRON_SECRET>
+//
+// Suggested schedule (Nigeria time, WAT = UTC+1):
+//   instant  every 15 minutes
+//   daily    every day at 07:00  (06:00 UTC)
+//   weekly   every day at 07:00  (people are picked by their chosen day)
+//   monthly  1st of the month at 07:00
+const FREQUENCIES = ["instant", "daily", "weekly", "monthly"];
+
+export async function sendJobAlerts(req, res) {
+  try {
+    const frequency = String(req.query.frequency || req.body?.frequency || "daily");
+    if (!FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ success: false, message: `frequency must be one of ${FREQUENCIES.join(", ")}` });
+    }
+    res.json(await jobAlertService.runJobAlerts(frequency));
+  } catch (err) {
+    console.error("[/api/cron/send-job-alerts] error:", err);
+    res.status(500).json({ success: false, message: err.message || "Something went wrong." });
+  }
+}
+
+// Same-day and urgent jobs, straight away.
+// POST /api/cron/send-urgent-job-alerts   (run every 10 minutes)
+export async function sendUrgentJobAlerts(req, res) {
+  try {
+    res.json(await jobAlertService.runUrgentAlerts());
+  } catch (err) {
+    console.error("[/api/cron/send-urgent-job-alerts] error:", err);
     res.status(500).json({ success: false, message: err.message || "Something went wrong." });
   }
 }
