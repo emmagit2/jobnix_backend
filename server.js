@@ -34,6 +34,10 @@ import referralRoutes from "./route/Referral.routes.js";
 import agentRoutes from "./route/agent.routes.js";
 import verifyRouter from "./route/verify.js";
 
+// ── Job seeker "Jobs for you" list ─────────────────────────────────────
+import { getMyMatchedJobs } from "./controllers/jobMatchController.js";
+import requireAuth from "./middleware/requireAuth.js";
+
 
 dotenv.config();
 
@@ -96,6 +100,7 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/seeker/notifications", seekerNotificationRoutes); // corporate not mounted yet — not ready
 app.use("/api/cron", cronRoutes);
 app.use("/api/ai", aiRoutes);
+app.get("/api/jobs/matched", requireAuth, getMyMatchedJobs); // must stay ABOVE /api/jobs
 app.use("/api/jobs", jobRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/companies", companyRoutes);

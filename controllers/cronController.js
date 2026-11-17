@@ -4,8 +4,9 @@ import * as jobsRepo from "../lib/jobsRepo.js";
 import * as notificationService from "../services/notificationService.js";
 import * as jobAlertService from "../services/jobAlertService.js";
 
-// External scheduler hits this every few hours.
-// POST /api/cron/check-expiring-jobs   header: x-cron-secret: <CRON_SECRET>
+// ── Business notifications (unchanged) ───────────────────────────────────────
+
+// POST /api/cron/check-expiring-jobs
 export async function checkExpiringJobs(req, res) {
   try {
     const jobs = await jobsRepo.findExpiringSoon(3); // deadline within 3 days, not yet notified
@@ -25,8 +26,7 @@ export async function checkExpiringJobs(req, res) {
   }
 }
 
-// External scheduler hits this once a week.
-// POST /api/cron/send-weekly-summaries   header: x-cron-secret: <CRON_SECRET>
+// POST /api/cron/send-weekly-summaries
 export async function sendWeeklySummaries(req, res) {
   try {
     const { data: businesses, error } = await supabase
@@ -66,37 +66,51 @@ export async function sendWeeklySummaries(req, res) {
   }
 }
 
-// Job match emails for job seekers.
-// POST /api/cron/send-job-alerts?frequency=instant|daily|weekly|monthly
-//   header: x-cron-secret: <CRON_SECRET>
+// ── Job seeker alerts ────────────────────────────────────────────────────────
 //
-// Suggested schedule (Nigeria time, WAT = UTC+1):
+// GET or POST /api/cron/send-job-alerts?frequency=instant|daily|weekly|monthly
+// GET or POST /api/cron/send-urgent-job-alerts
+//
+// Testing: add &dry=1 (log only, no emails, nothing marked as sent)
+//          and &only=you@email.com (just that one user)
+//
+// Schedule (Africa/Lagos):
 //   instant  every 15 minutes
-//   daily    every day at 07:00  (06:00 UTC)
-//   weekly   every day at 07:00  (people are picked by their chosen day)
-//   monthly  1st of the month at 07:00
+//   daily    every day 07:00
+//   weekly   every day 07:00 (people are picked by their chosen day)
+//   monthly  1st of the month 07:00
+//   urgent   every 15 minutes
 const FREQUENCIES = ["instant", "daily", "weekly", "monthly"];
 
-export async function sendJobAlerts(req, res) {
-  try {
-    const frequency = String(req.query.frequency || req.body?.frequency || "daily");
-    if (!FREQUENCIES.includes(frequency)) {
-      return res.status(400).json({ success: false, message: `frequency must be one of ${FREQUENCIES.join(", ")}` });
-    }
-    res.json(await jobAlertService.runJobAlerts(frequency));
-  } catch (err) {
-    console.error("[/api/cron/send-job-alerts] error:", err);
-    res.status(500).json({ success: false, message: err.message || "Something went wrong." });
-  }
+// Reply straight away and work in the background, so the scheduler never
+// times out. A run that is still going is not started twice.
+const running = new Set();
+
+function runInBackground(key, fn, res) {
+  if (running.has(key)) return res.json({ success: true, skipped: "already running" });
+  running.add(key);
+  res.status(202).json({ success: true, started: key });
+  fn()
+    .then((r) => console.log(`[cron:${key}]`, JSON.stringify(r)))
+    .catch((e) => console.error(`[cron:${key}] failed:`, e))
+    .finally(() => running.delete(key));
 }
 
-// Same-day and urgent jobs, straight away.
-// POST /api/cron/send-urgent-job-alerts   (run every 10 minutes)
-export async function sendUrgentJobAlerts(req, res) {
-  try {
-    res.json(await jobAlertService.runUrgentAlerts());
-  } catch (err) {
-    console.error("[/api/cron/send-urgent-job-alerts] error:", err);
-    res.status(500).json({ success: false, message: err.message || "Something went wrong." });
+const testOptions = (req) => ({
+  dry: req.query.dry === "1",
+  only: req.query.only ? String(req.query.only).trim() : null,
+});
+
+export async function sendJobAlerts(req, res) {
+  const frequency = String(req.query.frequency || req.body?.frequency || "daily");
+  if (!FREQUENCIES.includes(frequency)) {
+    return res
+      .status(400)
+      .json({ success: false, message: `frequency must be one of ${FREQUENCIES.join(", ")}` });
   }
+  runInBackground(frequency, () => jobAlertService.runJobAlerts(frequency, testOptions(req)), res);
+}
+
+export async function sendUrgentJobAlerts(req, res) {
+  runInBackground("urgent", () => jobAlertService.runUrgentAlerts(testOptions(req)), res);
 }
