@@ -71,7 +71,17 @@ export const receiveMessage = async (req, res) => {
       );
       return;
     }
-
+const greeting = /^(hi|hello|hey|hell0|good (morning|afternoon|evening)|menu|help)\b/i;
+if (greeting.test(inbound.text.trim())) {
+  await reply(
+    `👋 Hi ${business.business_name || "there"}! I'm the JobNix assistant.\n\n` +
+      "Ask me things like:\n" +
+      "• List my jobs\n" +
+      "• How many views did my Marketing Intern job get?\n" +
+      "• How many applications do I have?"
+  );
+  return;
+}
     const { data: recentRows, error: recentErr } = await supabase
       .from("ai_conversations")
       .select("*")
