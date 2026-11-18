@@ -1,90 +1,348 @@
-// lib/geminiService.js
+// services/geminiService.js
 //
-// WhatsApp business-stats assistant. Uses the SAME @google/genai package as
-// routes/ai.js (GoogleGenAI class, ai.models.generateContent) — NOT the
-// older @google/generative-ai package. Since @google/genai is already a
-// dependency (routes/ai.js uses it), this adds zero new packages.
+// JobNix WhatsApp business assistant (Gemini function calling).
+// Every number and name comes from your database via the tools below.
+//
+// Built against your real schema:
+//   jobs.submitted_by_business_id  -> the owning business
+//   jobs.status                    -> draft | pending | approved | rejected
+//   jobs.deadline (formal)         -> expiry date for formal jobs
+//   jobs.expires_at (informal)     -> expiry time for informal jobs
+//   jobs.view_count / click_count / application_count
+//
+// STILL A GUESS: the applications table (not shared yet). See APPLICATIONS_TABLE.
+// If it fails, the bot falls back to the application_count stored on each job.
 import { GoogleGenAI } from "@google/genai";
-import * as jobsRepo from "../lib/jobsRepo.js";
+import { supabase } from "../config/supabase.js";
+import { createPostJobLink } from "./postJobLinkService.js";
 
 const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-  console.warn("[lib/geminiService.js] GEMINI_API_KEY is not set in .env");
-}
+if (!apiKey) console.warn("[geminiService] GEMINI_API_KEY is not set in .env");
 const ai = new GoogleGenAI({ apiKey });
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-// Same transient-error handling as routes/ai.js's generateJSON.
+const APPLICATIONS_TABLE = "applications"; // expects: job_id, status, created_at, + a name column
+
+// Only these business_profiles fields are ever shown to Gemini.
+// (Never nin_number, phone, phone_verification_code, etc.)
+const SAFE_PROFILE_FIELDS = [
+  "business_name",
+  "industry",
+  "hiring_size",
+  "business_type",
+  "description",
+  "address",
+  "owner_name",
+];
+
+const JOB_COLUMNS =
+  "id,title,location,job_type,status,rejection_reason,work_type,deadline,expires_at," +
+  "created_date,view_count,click_count,application_count,workers_needed,is_urgent,payment_status";
+
 const RETRYABLE_STATUSES = [503, 429];
 const MAX_RETRIES = 2;
 const BASE_DELAY_MS = 1000;
+const MAX_TOOL_ROUNDS = 5;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Function-calling tools Gemini can invoke to answer questions like "how
-// many people viewed the Marketing Intern job" or "how many applied this
-// week". Gemini decides which function(s) it needs based on the question.
+// ── Tool declarations ──────────────────────────────────────────────────────
 const tools = [
   {
     functionDeclarations: [
       {
-        name: "listJobs",
-        description: "List all jobs posted by this business, with basic stats for each.",
+        name: "getBusinessOverview",
+        description:
+          "Full overview of this business: profile, whether it has posted jobs, how many jobs are " +
+          "live, expired, pending approval, draft or rejected, and total views, clicks and applications. " +
+          "Use for 'how am I doing', 'do I have any jobs', 'give me a summary'.",
         parameters: { type: "object", properties: {} },
+      },
+      {
+        name: "listJobs",
+        description:
+          "List this business's jobs (newest first) with status, views, clicks and applications. " +
+          "Optionally filter by status: live, expired, pending, draft or rejected.",
+        parameters: {
+          type: "object",
+          properties: {
+            filter: { type: "string", enum: ["all", "live", "expired", "pending", "draft", "rejected"] },
+          },
+        },
       },
       {
         name: "getJobStats",
         description:
-          "Get detailed stats (views, clicks, applications) for one specific job, matched by title (partial match allowed).",
+          "Detailed stats for one job, matched by title (partial match allowed). " +
+          "Also use to explain why a job is pending or rejected.",
+        parameters: {
+          type: "object",
+          properties: { jobTitle: { type: "string", description: "Title or partial title of the job" } },
+          required: ["jobTitle"],
+        },
+      },
+      {
+        name: "listApplicants",
+        description:
+          "List recent applicants. Pass jobTitle for one job, or omit it for all jobs.",
         parameters: {
           type: "object",
           properties: {
-            jobTitle: {
-              type: "string",
-              description: "The title or partial title of the job the user is asking about",
-            },
+            jobTitle: { type: "string", description: "Optional title or partial title" },
+            limit: { type: "integer", description: "How many to return (default 5, max 10)" },
           },
-          required: ["jobTitle"],
+        },
+      },
+      {
+        name: "createPostJobLink",
+        description:
+          "Create a secure link where the owner can post a new job on the JobNix website. " +
+          "Use when they want to post, create or advertise a job or hire someone. " +
+          "Pass any details they already mentioned so the form is pre-filled. Do not ask for more details first.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Job title, e.g. Cleaner" },
+            location: { type: "string", description: "Job location, e.g. Yaba, Lagos" },
+            pay_type: { type: "string", enum: ["Daily", "Weekly", "Monthly", "Per job"] },
+            pay_amount: { type: "string", description: "Pay amount as the user said it, e.g. 5000" },
+            workers_needed: { type: "integer", description: "Number of workers, 1 to 10" },
+          },
+        },
+      },
+      {
+        name: "getApplicationsSummary",
+        description:
+          "Count applications received in a time period with a per-job breakdown. " +
+          "Use for 'how many applied today / this week / this month'.",
+        parameters: {
+          type: "object",
+          properties: { period: { type: "string", enum: ["today", "week", "month", "all"] } },
+          required: ["period"],
         },
       },
     ],
   },
 ];
 
-function deriveStatus(job) {
-  if (!job.deadline) return "active";
-  return new Date(job.deadline) >= new Date(new Date().toDateString()) ? "active" : "expired";
+// ── Helpers ────────────────────────────────────────────────────────────────
+function isExpired(job) {
+  if (job.expires_at) return new Date(job.expires_at) < new Date(); // informal jobs
+  if (job.deadline) return new Date(job.deadline) < new Date(new Date().toDateString()); // formal jobs
+  return false;
 }
 
-async function listJobs(businessId) {
-  const jobs = await jobsRepo.listByBusiness(businessId);
-  return jobs.map((j) => ({
-    title: j.title,
-    status: deriveStatus(j),
-    views: j.view_count,
-    clicks: j.click_count,
-    applications: j.application_count,
-  }));
+// "live" = approved by admin and not past its expiry
+const isLive = (job) => job.status === "approved" && !isExpired(job);
+
+function jobState(job) {
+  if (job.status !== "approved") return job.status; // draft | pending | rejected
+  return isExpired(job) ? "expired" : "live";
 }
 
-async function getJobStats(businessId, jobTitle) {
-  const job = await jobsRepo.findByTitleForBusiness(businessId, jobTitle);
-  if (!job) return { found: false, jobTitle };
-  return {
-    found: true,
+function summarizeJob(job) {
+  const out = {
     title: job.title,
-    status: deriveStatus(job),
+    state: jobState(job),
     views: job.view_count,
     clicks: job.click_count,
     applications: job.application_count,
+    workersNeeded: job.workers_needed,
+  };
+  if (job.is_urgent) out.urgent = true;
+  const closes = job.expires_at || job.deadline;
+  if (closes) out.closes = closes;
+  if (job.status === "rejected" && job.rejection_reason) out.rejectionReason = job.rejection_reason;
+  if (job.payment_status && job.payment_status !== "not_required") out.paymentStatus = job.payment_status;
+  return out;
+}
+
+// Start of period in UTC. "today" uses Lagos time (UTC+1).
+function periodStart(period) {
+  if (period === "all") return null;
+  const now = Date.now();
+  if (period === "today") {
+    const lagos = new Date(now + 3600000);
+    return new Date(Date.UTC(lagos.getUTCFullYear(), lagos.getUTCMonth(), lagos.getUTCDate()) - 3600000);
+  }
+  return new Date(now - (period === "week" ? 7 : 30) * 86400000);
+}
+
+const applicantName = (a) => a.applicant_name || a.full_name || a.name || "Applicant";
+
+async function fetchBusinessJobs(businessId) {
+  const { data, error } = await supabase
+    .from("jobs")
+    .select(JOB_COLUMNS)
+    .eq("submitted_by_business_id", businessId)
+    .order("created_date", { ascending: false })
+    .limit(200);
+  if (error) throw error;
+  return data || [];
+}
+
+async function findJobsByTitle(businessId, title) {
+  const cleaned = String(title || "").replace(/[%_,]/g, " ").trim();
+  if (!cleaned) return [];
+  const { data, error } = await supabase
+    .from("jobs")
+    .select(JOB_COLUMNS)
+    .eq("submitted_by_business_id", businessId)
+    .ilike("title", `%${cleaned}%`)
+    .order("created_date", { ascending: false })
+    .limit(3);
+  if (error) throw error;
+  return data || [];
+}
+
+// ── Tool implementations ───────────────────────────────────────────────────
+async function getBusinessOverview(businessId) {
+  const { data: profileRow } = await supabase
+    .from("business_profiles")
+    .select("*")
+    .eq("id", businessId)
+    .single();
+
+  const profile = {};
+  for (const key of SAFE_PROFILE_FIELDS) {
+    if (profileRow && profileRow[key] != null && profileRow[key] !== "") profile[key] = profileRow[key];
+  }
+
+  const jobs = await fetchBusinessJobs(businessId);
+  const count = (fn) => jobs.filter(fn).length;
+  const sum = (key) => jobs.reduce((n, j) => n + (j[key] || 0), 0);
+  const submitted = count((j) => j.status !== "draft");
+
+  return {
+    profile,
+    hasPostedJobs: submitted > 0,
+    totalJobs: jobs.length,
+    liveJobs: count(isLive),
+    expiredJobs: count((j) => j.status === "approved" && isExpired(j)),
+    pendingApproval: count((j) => j.status === "pending"),
+    draftJobs: count((j) => j.status === "draft"),
+    rejectedJobs: count((j) => j.status === "rejected"),
+    totalViews: sum("view_count"),
+    totalClicks: sum("click_count"),
+    totalApplications: sum("application_count"),
+    hasApplicants: sum("application_count") > 0,
+  };
+}
+
+async function listJobs(businessId, { filter } = {}) {
+  const jobs = await fetchBusinessJobs(businessId);
+  if (jobs.length === 0) return { hasPostedJobs: false, jobs: [] };
+
+  const f = filter || "all";
+  const picked = jobs.filter((j) => f === "all" || jobState(j) === f);
+  return {
+    hasPostedJobs: true,
+    filter: f,
+    total: picked.length,
+    jobs: picked.slice(0, 10).map(summarizeJob),
+    moreNotShown: Math.max(picked.length - 10, 0),
+  };
+}
+
+async function getJobStats(businessId, jobTitle) {
+  const matches = await findJobsByTitle(businessId, jobTitle);
+  if (matches.length === 0) return { found: false, jobTitle };
+  return { found: true, matches: matches.map(summarizeJob) };
+}
+
+async function resolveJobScope(businessId, jobTitle) {
+  const jobs = jobTitle ? await findJobsByTitle(businessId, jobTitle) : await fetchBusinessJobs(businessId);
+  const scoped = jobTitle ? jobs : jobs.filter((j) => j.status !== "draft");
+  const titleById = {};
+  scoped.forEach((j) => (titleById[j.id] = j.title));
+  return { jobs: scoped, jobIds: scoped.map((j) => j.id), titleById };
+}
+
+async function listApplicants(businessId, { jobTitle, limit } = {}) {
+  const scope = await resolveJobScope(businessId, jobTitle);
+  if (jobTitle && scope.jobs.length === 0) return { found: false, jobTitle };
+  if (scope.jobs.length === 0) return { hasPostedJobs: false, applicants: [] };
+
+  const take = Math.min(Math.max(Number(limit) || 5, 1), 10);
+  const { data, error } = await supabase
+    .from(APPLICATIONS_TABLE)
+    .select("*")
+    .in("job_id", scope.jobIds)
+    .order("created_at", { ascending: false })
+    .limit(take);
+
+  if (error) {
+    // Fallback: no applicant details, but counts per job still work.
+    console.error("[geminiService] applications lookup failed:", error.message);
+    return {
+      detailsUnavailable: true,
+      applicationsPerJob: scope.jobs.map((j) => ({ title: j.title, applications: j.application_count })),
+    };
+  }
+
+  return {
+    hasPostedJobs: true,
+    count: data.length,
+    applicants: data.map((a) => ({
+      name: applicantName(a),
+      job: scope.titleById[a.job_id] || "Unknown job",
+      status: a.status || "new",
+      appliedAt: a.created_at,
+    })),
+  };
+}
+
+async function getApplicationsSummary(businessId, { period } = {}) {
+  const scope = await resolveJobScope(businessId, null);
+  if (scope.jobs.length === 0) return { hasPostedJobs: false, total: 0 };
+
+  const p = period || "week";
+  let query = supabase
+    .from(APPLICATIONS_TABLE)
+    .select("job_id, created_at")
+    .in("job_id", scope.jobIds)
+    .limit(1000);
+  const start = periodStart(p);
+  if (start) query = query.gte("created_at", start.toISOString());
+
+  const { data, error } = await query;
+  if (error) {
+    console.error("[geminiService] applications summary failed:", error.message);
+    return {
+      periodUnavailable: true,
+      totalApplicationsAllTime: scope.jobs.reduce((n, j) => n + (j.application_count || 0), 0),
+    };
+  }
+
+  const perJob = {};
+  data.forEach((a) => {
+    const title = scope.titleById[a.job_id] || "Unknown job";
+    perJob[title] = (perJob[title] || 0) + 1;
+  });
+
+  return {
+    hasPostedJobs: true,
+    period: p,
+    total: data.length,
+    perJob: Object.entries(perJob).map(([title, applications]) => ({ title, applications })),
   };
 }
 
 async function functionRouter(businessId, name, args) {
-  if (name === "listJobs") return listJobs(businessId);
-  if (name === "getJobStats") return getJobStats(businessId, args.jobTitle);
-  return { error: "unknown_function" };
+  try {
+    if (name === "getBusinessOverview") return await getBusinessOverview(businessId);
+    if (name === "listJobs") return await listJobs(businessId, args);
+    if (name === "getJobStats") return await getJobStats(businessId, args.jobTitle);
+    if (name === "listApplicants") return await listApplicants(businessId, args);
+    if (name === "getApplicationsSummary") return await getApplicationsSummary(businessId, args);
+    if (name === "createPostJobLink") return await createPostJobLink(businessId, args);
+    return { error: "unknown_function" };
+  } catch (err) {
+    console.error(`[geminiService] tool ${name} failed:`, err);
+    return { error: "lookup_failed" };
+  }
 }
 
+// ── Gemini call with retry ─────────────────────────────────────────────────
 async function generateWithRetry(contents, config) {
   let lastErr;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -95,54 +353,80 @@ async function generateWithRetry(contents, config) {
       const isRetryable = RETRYABLE_STATUSES.includes(err?.status);
       if (!isRetryable || attempt === MAX_RETRIES) throw err;
       const delay = BASE_DELAY_MS * Math.pow(2, attempt);
-      console.warn(
-        `[lib/geminiService.js] Gemini call failed with status ${err.status} (attempt ${attempt + 1}/${MAX_RETRIES + 1}). Retrying in ${delay}ms…`
-      );
+      console.warn(`[geminiService] Gemini status ${err.status}, retrying in ${delay}ms…`);
       await sleep(delay);
     }
   }
   throw lastErr;
 }
 
+function buildSystemInstruction() {
+  const today = new Date().toLocaleDateString("en-GB", {
+    timeZone: "Africa/Lagos",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+  return (
+    "You are the JobNix WhatsApp assistant for business owners. " +
+    `Today is ${today} (Lagos time). ` +
+    "You can report on: whether they have posted jobs, each job's state, views, clicks and applications, " +
+    "who applied, and how many applied today, this week or this month. " +
+    "Job states: live = approved and open; expired = approved but past its closing date; " +
+    "pending = submitted and waiting for JobNix admin approval; draft = saved but not submitted; " +
+    "rejected = declined by admin (a rejectionReason may be given). " +
+    "RULES: " +
+    "1) For greetings or small talk, reply in one or two friendly lines and say what they can ask. Call no tool. " +
+    "2) For any question about their business, jobs or applicants, ALWAYS call the right tool first. " +
+    "Never guess or invent numbers, names or reasons. " +
+    "3) If hasPostedJobs is false, say they haven't posted a job yet (mention drafts if draftJobs > 0) and suggest posting from the dashboard. " +
+    "4) If they have jobs but zero applications, say so clearly and mention which job has the most views if useful. " +
+    "5) If a job is pending, explain it is awaiting admin approval and won't get views until approved. " +
+    "If rejected, share the rejectionReason if there is one. " +
+    "6) If a job title isn't found, say so and offer to list their jobs. If several jobs match, list them and ask which one. " +
+    "7) If a tool returns detailsUnavailable or periodUnavailable, give the counts you do have and say applicant names or dates aren't available right now. " +
+    "8) If a tool returns an error, apologise briefly and ask them to try again. " +
+    "9) If they want to post a job, call createPostJobLink right away with any details they gave, then send the link " +
+    "on its own line, say it works for about 30 minutes, and that they finish the details and payment on the website. " +
+    "Never take payment or promise a price in chat. " +
+    "10) You cannot edit or delete jobs, or message applicants. Say so and list what you can do. " +
+    "Style: short, friendly plain text for WhatsApp. No markdown tables or headings. Simple • bullets are fine. " +
+    "Never mention tools, databases or function names."
+  );
+}
+
 /**
- * Answers a business owner's WhatsApp question in natural language, using
- * live job data via function calling.
+ * Answers a business owner's WhatsApp question using live data via function calling.
  *
  * @param {string} businessId
- * @param {string} userMessage - raw WhatsApp message text
- * @param {Array<{role: 'user'|'model', parts: [{text: string}]}>} history - recent chat turns
+ * @param {string} userMessage
+ * @param {Array<{role: 'user'|'model', parts: [{text: string}]}>} history
  */
 export async function answerBusinessQuestion(businessId, userMessage, history = []) {
-  const contents = [...history, { role: "user", parts: [{ text: userMessage }] }];
+  // Gemini rejects history that starts with a "model" turn.
+  const cleanHistory = [...history];
+  while (cleanHistory.length && cleanHistory[0].role === "model") cleanHistory.shift();
 
-  const config = {
-    tools,
-   systemInstruction:
-  "You are the JobNix WhatsApp assistant. You help business owners check stats on the jobs " +
-  "they've posted (views, clicks, applications, active or expired). " +
-  "If the message is a greeting or small talk, reply in one or two friendly lines and tell " +
-  "them what they can ask. Do NOT call any function for greetings. " +
-  "For questions about jobs, always use the provided functions to fetch real numbers " +
-  "before answering. Never guess or invent numbers. " +
-  "If asked something you can't do, say so briefly and list what you can help with. " +
-  "Keep replies short, plain text, suitable for WhatsApp (no markdown tables, no headings).",
-  };
+  const contents = [...cleanHistory, { role: "user", parts: [{ text: userMessage }] }];
+  const config = { tools, systemInstruction: buildSystemInstruction() };
 
   let response = await generateWithRetry(contents, config);
 
-  // Handle one or more rounds of function calling.
-  while (response.functionCalls && response.functionCalls.length > 0) {
+  let rounds = 0;
+  while (response.functionCalls && response.functionCalls.length > 0 && rounds < MAX_TOOL_ROUNDS) {
+    rounds++;
     contents.push(response.candidates[0].content);
 
     const responseParts = [];
     for (const call of response.functionCalls) {
       const output = await functionRouter(businessId, call.name, call.args || {});
-      responseParts.push({ functionResponse: { name: call.name, response: output, id: call.id } });
+      responseParts.push({ functionResponse: { name: call.name, response: { output }, id: call.id } });
     }
     contents.push({ role: "user", parts: responseParts });
 
     response = await generateWithRetry(contents, config);
   }
 
-  return response.text;
+  return response.text || "Sorry, I couldn't put an answer together. Please try asking again.";
 }
