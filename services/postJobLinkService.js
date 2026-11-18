@@ -51,8 +51,13 @@ export async function createPostJobLink(businessId, prefillInput = {}) {
   });
   if (error) throw error;
 
+  // URL API: works whether POST_JOB_PATH is "/business/post-job" or already has
+  // a query such as "/dashboard?tab=jobs" (adds &wa=... instead of a second "?").
+  const url = new URL(POST_JOB_PATH, `${FRONTEND_URL}/`);
+  url.searchParams.set("wa", token);
+
   return {
-    link: `${FRONTEND_URL}${POST_JOB_PATH}?wa=${token}`,
+    link: url.toString(),
     expiresInMinutes: LINK_TTL_MINUTES,
   };
 }
