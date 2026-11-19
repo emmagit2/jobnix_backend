@@ -3,8 +3,9 @@
 // JobNix WhatsApp business assistant (Gemini function calling).
 // Every number and name comes from your database via the tools below.
 //
-// Posting a job: Gemini only STARTS the flow with startJobPosting. The questions,
-// price and payment link are handled by services/postJobFlowService.js.
+// Posting a job: Gemini only STARTS the flow with startJobPosting (the owner's original
+// message is passed along). Reading the details, price and payment link are handled by
+// services/postJobFlowService.js.
 //
 // Built against your real schema:
 //   jobs.submitted_by_business_id  -> the owning business
@@ -112,7 +113,7 @@ const tools = [
         description:
           "Start posting a new job here in WhatsApp. Use when the owner wants to post, create or " +
           "advertise a job or hire someone. Takes no arguments. Do not ask them for details first: " +
-          "the questions are asked automatically after this.",
+          "their message is read automatically and only missing details are asked after this.",
         parameters: { type: "object", properties: {} },
       },
       {
@@ -355,7 +356,7 @@ function getDashboardLink({ section } = {}) {
   return { section: key, link: `${FRONTEND_URL}${DASHBOARD_PATHS[key]}` };
 }
 
-async function functionRouter(businessId, name, args) {
+async function functionRouter(businessId, name, args, userMessage = "") {
   try {
     if (name === "getDashboardLink") return getDashboardLink(args);
     if (name === "getBusinessOverview") return await getBusinessOverview(businessId);
@@ -363,7 +364,7 @@ async function functionRouter(businessId, name, args) {
     if (name === "getJobStats") return await getJobStats(businessId, args.jobTitle);
     if (name === "listApplicants") return await listApplicants(businessId, args);
     if (name === "getApplicationsSummary") return await getApplicationsSummary(businessId, args);
-    if (name === "startJobPosting") return await startJobPosting(businessId);
+    if (name === "startJobPosting") return await startJobPosting(businessId, userMessage);
     return { error: "unknown_function" };
   } catch (err) {
     console.error(`[geminiService] tool ${name} failed:`, err);
@@ -452,7 +453,7 @@ export async function answerBusinessQuestion(businessId, userMessage, history = 
 
     const responseParts = [];
     for (const call of response.functionCalls) {
-      const output = await functionRouter(businessId, call.name, call.args || {});
+      const output = await functionRouter(businessId, call.name, call.args || {}, userMessage);
       responseParts.push({ functionResponse: { name: call.name, response: { output }, id: call.id } });
     }
     contents.push({ role: "user", parts: responseParts });

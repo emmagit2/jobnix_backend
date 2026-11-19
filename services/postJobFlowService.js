@@ -3,12 +3,15 @@
 // Posts an informal job entirely inside WhatsApp: asks the form questions one by one,
 // saves the job (status "pending", payment "pending") exactly like the website's
 // submitInformalJob, and sends a Paystack payment link.
-// Gemini only STARTS the flow (startJobPosting). Everything after that is fixed
-// code, so the model can never skip a question or change a price.
+// The owner can describe the whole job in ONE message. Gemini only EXTRACTS fields from
+// it (jobDraftExtractor.js); every value is re-checked here with the same rules as the
+// step-by-step questions, and the price is always calculated in code. The bot then asks
+// only for what is missing. If Gemini fails, it falls back to one question at a time.
 import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import * as paymentsRepo from "../lib/paymentsRepo.js";
 import { initializeTransaction } from "./paystackService.js";
+import { extractJobFields } from "./jobDraftExtractor.js";
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -114,17 +117,176 @@ const STEPS = {
 };
 const ORDER = ["category", "title", "address", "description", "pay_type", "pay_amount", "state", "areas", "plan", "workers"];
 
+// ── One-message posting ────────────────────────────────────────────────────
+// Fields the owner must give. address (optional), description (written for them) and
+// workers (1 is included) get defaults. Same relative order as ORDER.
+const SMART_REQUIRED = ["category", "title", "pay_type", "pay_amount", "state", "areas", "plan"];
+
+let extractor = extractJobFields;
+/** Test hook: swap the Gemini extractor for a fake. Call with no argument to restore. */
+export function _setExtractorForTests(fn) {
+  extractor = fn || extractJobFields;
+}
+
+const publicDraft = (d) => Object.fromEntries(Object.entries(d || {}).filter(([k]) => !k.startsWith("_")));
+const num = (v) => (typeof v === "number" || (typeof v === "string" && v.trim() !== "") ? Number(v) : NaN);
+const isStr = (v) => typeof v === "string" && v.trim() !== "";
+
+/** Keeps only the values that pass the same rules as the step-by-step questions. */
+function cleanFields(raw) {
+  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const out = {};
+
+  if (isStr(r.category)) {
+    const hit = CATEGORIES.find((c) => c.toLowerCase() === r.category.trim().toLowerCase());
+    if (hit) out.category = hit;
+  }
+  if (isStr(r.title)) {
+    const p = STEPS.title.parse(r.title);
+    if (p.value) out.title = p.value;
+  }
+  if (isStr(r.address)) out.address = r.address.trim().slice(0, 200);
+  if (isStr(r.description)) {
+    const p = STEPS.description.parse(r.description);
+    if (p.value) out.description = p.value;
+  }
+  if (isStr(r.pay_type)) {
+    const hit = PAY_TYPES.find((x) => x.toLowerCase() === r.pay_type.trim().toLowerCase());
+    if (hit) out.pay_type = hit;
+  }
+  if (typeof r.pay_amount === "number" || isStr(r.pay_amount)) {
+    const p = STEPS.pay_amount.parse(String(r.pay_amount));
+    if (p.value) out.pay_amount = p.value;
+  }
+  if (isStr(r.state)) {
+    const p = STEPS.state.parse(r.state);
+    if (p.value) out.state = p.value;
+  }
+  if (Array.isArray(r.areas)) {
+    const names = r.areas.filter(isStr).map((x) => x.trim());
+    if (names.length) out.areas = names.join(", ").slice(0, 300);
+  } else if (isStr(r.areas)) {
+    out.areas = /^all( areas)?$/i.test(r.areas.trim()) ? "All areas" : r.areas.trim().slice(0, 300);
+  }
+  const plan = num(r.plan);
+  if (Number.isInteger(plan) && PLANS[plan]) out.plan = plan;
+  const workers = num(r.workers);
+  if (Number.isInteger(workers) && workers >= 1 && workers <= 10) out.workers = workers;
+
+  return out;
+}
+
+/** Ask Gemini to read the text, then keep only what is valid. {} if nothing usable. */
+async function smartExtract(text, current = null) {
+  let raw = {};
+  try {
+    raw = await extractor(text, {
+      categories: CATEGORIES,
+      payTypes: PAY_TYPES,
+      states: STATES,
+      current: current ? publicDraft(current) : null,
+    });
+  } catch (err) {
+    console.error("[postJobFlow] extractor failed:", err.message);
+  }
+  return cleanFields(raw);
+}
+
+const defaultDescription = (d) =>
+  `Hiring: ${d.title} (${d.category || "general"}). Reliable and hardworking applicants are welcome to apply.`;
+
+function applyDefaults(d) {
+  const out = { ...d };
+  if (out.workers === undefined) out.workers = 1;
+  if (out.address === undefined) out.address = "";
+  if (out.description === undefined && out.title) {
+    out.description = defaultDescription(out);
+    out._autoDesc = true; // so a later title change can refresh it
+  }
+  return out;
+}
+
+const MISSING_LINES = {
+  category: () => "the type of business (e.g. Barbing Salon, Driver, Cleaning)",
+  title: () => "the job title (e.g. Barber)",
+  state: () => "the state you want to hire from (e.g. Lagos)",
+  areas: (d) => (d.state ? `the areas in ${d.state}, or ALL (e.g. Yaba, Surulere)` : "the areas to hire from, or ALL"),
+  plan: () =>
+    "how long the job stays live: " +
+    (() => {
+      const opts = Object.values(PLANS).map((p) => `${p.label} (${naira(p.price)})`);
+      return opts.slice(0, -1).join(", ") + " or " + opts[opts.length - 1];
+    })(),
+};
+
+function askMissing(d, missing) {
+  const lines = [];
+  const noType = missing.includes("pay_type");
+  const noAmount = missing.includes("pay_amount");
+  for (const k of missing) {
+    if (k === "pay_type" || k === "pay_amount") {
+      if (k === "pay_amount" && noType) continue; // covered by the combined pay line
+      lines.push(
+        noType && noAmount
+          ? "how much you pay and how often (e.g. ₦5k daily)"
+          : noType
+            ? "how often you pay: daily, weekly, monthly or per job"
+            : "how much you pay, in naira (e.g. 5000)"
+      );
+    } else {
+      lines.push(MISSING_LINES[k](d));
+    }
+  }
+  if (lines.length === 1) return `Almost there. Please tell me ${lines[0]}.\n\nReply CANCEL to stop.`;
+  return `Almost there. Please tell me:\n${lines.map((l) => `• ${l}`).join("\n")}\n\nYou can send it all in one message. Reply CANCEL to stop.`;
+}
+
+/** Fills defaults, then either shows the summary or asks for what is still missing. */
+async function moveOn(businessId, rawDraft) {
+  const draft = applyDefaults(rawDraft);
+  const missing = SMART_REQUIRED.filter((k) => draft[k] === undefined);
+  if (missing.length === 0) {
+    await saveSession(businessId, "confirm", draft);
+    return summary(draft);
+  }
+  await saveSession(businessId, "fill", draft);
+  return askMissing(draft, missing);
+}
+
+/** Falls back to the classic one-question-at-a-time flow for whatever is still missing. */
+async function stepByStep(businessId, rawDraft, lead = "") {
+  const draft = applyDefaults(rawDraft);
+  const first = SMART_REQUIRED.find((k) => draft[k] === undefined);
+  if (!first) return await moveOn(businessId, draft);
+  await saveSession(businessId, first, draft);
+  return lead + STEPS[first].ask(draft);
+}
+
+/** Merges newly read fields into a draft, dropping anything the change makes stale. */
+function mergeFields(draft, found) {
+  const merged = { ...draft, ...found };
+  // New state: the old areas belong to the old state, so ask again.
+  if (found.state && found.state !== draft.state && found.areas === undefined) delete merged.areas;
+  // Own description wins; an auto-written one is refreshed when the job itself changes.
+  if (found.description !== undefined) merged._autoDesc = false;
+  else if (draft._autoDesc && (found.title || found.category)) delete merged.description;
+  return merged;
+}
+
 function summary(d) {
+  const about = d.description ? d.description.replace(/\s+/g, " ").slice(0, 160) : null;
   return [
     "Please check your job:",
     `• ${d.title} (${d.category})`,
     d.address ? `• Address: ${d.address}` : null,
+    about ? `• About: ${about}${d.description.length > 160 ? "…" : ""}` : null,
     `• Pay: ${naira(d.pay_amount)} ${d.pay_type.toLowerCase()}`,
     `• Hiring from: ${d.areas}, ${d.state}`,
     `• Live for ${PLANS[d.plan].label}, ${d.workers} worker${d.workers > 1 ? "s" : ""}`,
     `• Total to pay: ${naira(calcTotal(d.plan, d.workers))}`,
     "",
-    "Reply YES to get your payment link, EDIT to start again, or CANCEL.",
+    'Reply YES to get your payment link. To change something, just tell me (e.g. "make it ₦6k" or "3 workers"). ' +
+      "EDIT starts again, CANCEL stops.",
   ].filter(Boolean).join("\n");
 }
 
@@ -154,14 +316,28 @@ export async function getActiveSession(businessId) {
   return data;
 }
 
-/** Called by the Gemini tool when the owner wants to post a job. */
-export async function startJobPosting(businessId) {
-  await saveSession(businessId, "category", {});
-  return {
-    started: true,
-    firstMessage:
-      "Let's post your job. I'll ask a few quick questions. Reply CANCEL any time.\n\n" + STEPS.category.ask({}),
-  };
+/**
+ * Called by the Gemini tool when the owner wants to post a job.
+ * userMessage is the owner's ORIGINAL message, so "I need 2 barbers in Yaba, 5k daily"
+ * can fill most of the job in one go.
+ */
+export async function startJobPosting(businessId, userMessage = "") {
+  const header = "Let's post your job. Reply CANCEL any time.\n\n";
+  const text = String(userMessage || "").trim();
+
+  const found = text.length > 12 ? await smartExtract(text) : {};
+  if (Object.keys(found).length === 0) {
+    await saveSession(businessId, "intro", {});
+    return {
+      started: true,
+      firstMessage:
+        header +
+        "Tell me about the job in one message: who you need, where, how much you pay and for how long.\n" +
+        'Example: "I need 2 barbers in Yaba, Lagos, ₦5k daily, for 1 month"\n\n' +
+        "Or reply STEPS and I'll ask one question at a time.",
+    };
+  }
+  return { started: true, firstMessage: header + (await moveOn(businessId, found)) };
 }
 
 // ── Job + payment ──────────────────────────────────────────────────────────
@@ -296,7 +472,17 @@ export async function handlePostJobMessage(business, session, text, whatsappNumb
       await saveSession(businessId, "category", {});
       return "Okay, let's start again.\n\n" + STEPS.category.ask({});
     }
-    if (!/^(yes|y)$/i.test(t)) return "Reply YES to get your payment link, EDIT to start again, or CANCEL.";
+    if (!/^(yes|y)$/i.test(t)) {
+      // Anything else is treated as a change request ("make it 6k", "3 workers").
+      const found = await smartExtract(t, session.draft);
+      if (Object.keys(found).length === 0) {
+        return (
+          "I didn't catch a change. Reply YES to get your payment link, tell me what to change " +
+          '(e.g. "make it ₦6k"), EDIT to start again, or CANCEL.'
+        );
+      }
+      return await moveOn(businessId, mergeFields(session.draft, found));
+    }
 
     try {
       const { url, amount } = await createJobAndPaymentLink(business, whatsappNumber, session.draft);
@@ -311,6 +497,28 @@ export async function handlePostJobMessage(business, session, text, whatsappNumb
     }
   }
 
+  if (session.step === "intro") {
+    if (/^steps$/i.test(t)) {
+      await saveSession(businessId, "category", {});
+      return STEPS.category.ask({});
+    }
+    const found = await smartExtract(t);
+    if (Object.keys(found).length === 0) {
+      await saveSession(businessId, "category", {});
+      return "I couldn't read that, so let's go one question at a time.\n\n" + STEPS.category.ask({});
+    }
+    return await moveOn(businessId, found);
+  }
+
+  if (session.step === "fill") {
+    if (/^steps$/i.test(t)) return await stepByStep(businessId, session.draft);
+    const found = await smartExtract(t, session.draft);
+    if (Object.keys(found).length === 0) {
+      return await stepByStep(businessId, session.draft, "I couldn't read that, so let's go one question at a time.\n\n");
+    }
+    return await moveOn(businessId, mergeFields(session.draft, found));
+  }
+
   const step = STEPS[session.step];
   if (!step) {
     await clearSession(businessId);
@@ -321,7 +529,7 @@ export async function handlePostJobMessage(business, session, text, whatsappNumb
   if (result.error) return result.error + "\n\n" + step.ask(session.draft);
 
   const draft = { ...session.draft, [session.step]: result.value };
-  const next = ORDER[ORDER.indexOf(session.step) + 1];
+  const next = ORDER.slice(ORDER.indexOf(session.step) + 1).find((k) => draft[k] === undefined);
   if (!next) {
     await saveSession(businessId, "confirm", draft);
     return summary(draft);

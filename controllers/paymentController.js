@@ -1,4 +1,4 @@
- import crypto from "crypto";
+import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import * as paymentsRepo from "../lib/paymentsRepo.js";
 import * as jobsRepo from "../lib/jobsRepo.js";
@@ -167,6 +167,24 @@ export async function initializePremiumUpgrade(req, res) {
   return updated;
 }
 
+// Page shown after paying for a job that was posted from WhatsApp.
+function whatsappReturnPage(success) {
+  const number = String(process.env.TWILIO_WHATSAPP_FROM || "").replace(/\D/g, "");
+  const link = number ? `https://wa.me/${number}` : "";
+  const title = success ? "Payment received" : "Payment not completed";
+  const text = success
+    ? "Thank you. Your job is now being reviewed. We will message you on WhatsApp when it is live."
+    : "Your payment did not go through. Go back to WhatsApp and send &quot;post a job&quot; to try again.";
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>body{font-family:system-ui,sans-serif;background:#f6f7f9;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+.c{background:#fff;max-width:380px;margin:16px;padding:28px;border-radius:14px;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.08)}
+h1{font-size:22px;margin:0 0 10px}p{color:#444;line-height:1.5}
+a{display:inline-block;margin-top:14px;padding:12px 22px;background:#25d366;color:#fff;border-radius:10px;text-decoration:none;font-weight:600}</style></head>
+<body><div class="c"><h1>${success ? "&#10003; " : ""}${title}</h1><p>${text}</p>
+${link ? `<a href="${link}">Back to WhatsApp</a>` : ""}</div></body></html>`;
+}
+
 // Paystack redirects the browser here after checkout.
 export async function handleCallback(req, res) {
   const { reference } = req.query;
@@ -181,6 +199,12 @@ export async function handleCallback(req, res) {
     await finalizePaymentIfSuccessful(reference).catch((err) => {
       console.error("finalizePaymentIfSuccessful (from callback) failed:", err);
     });
+  }
+
+  // Paid from WhatsApp? The owner is on their phone and may not be logged in,
+  // so show a simple page that sends them back to the WhatsApp chat instead.
+  if (tx.metadata?.whatsapp) {
+    return res.status(200).type("html").send(whatsappReturnPage(success));
   }
 
   // Send informal-job payments back to the dashboard's Jobs tab (there's no
