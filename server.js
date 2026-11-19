@@ -33,7 +33,7 @@ import cronRoutes from "./route/cronRoutes.js";
 import referralRoutes from "./route/Referral.routes.js";
 import agentRoutes from "./route/agent.routes.js";
 import verifyRouter from "./route/verify.js";
-
+import businessVerificationRoutes from "./route/businessVerification.js";
 // ── Job seeker "Jobs for you" list ─────────────────────────────────────
 import { getMyMatchedJobs } from "./controllers/jobMatchController.js";
 import requireAuth from "./middleware/requireAuth.js";
@@ -96,6 +96,7 @@ app.use(guestMessagesRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/whatsapp", whatsappRoutes);
 app.use("/api/account", accountRoutes);
+app.use("/api/business", businessVerificationRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/seeker/notifications", seekerNotificationRoutes); // corporate not mounted yet — not ready
 app.use("/api/cron", cronRoutes);
