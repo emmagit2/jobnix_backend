@@ -3,6 +3,9 @@
 // JobNix WhatsApp business assistant (Gemini function calling).
 // Every number and name comes from your database via the tools below.
 //
+// Posting a job: Gemini only STARTS the flow with startJobPosting. The questions,
+// price and payment link are handled by services/postJobFlowService.js.
+//
 // Built against your real schema:
 //   jobs.submitted_by_business_id  -> the owning business
 //   jobs.status                    -> draft | pending | approved | rejected
@@ -14,7 +17,7 @@
 // If it fails, the bot falls back to the application_count stored on each job.
 import { GoogleGenAI } from "@google/genai";
 import { supabase } from "../config/supabase.js";
-import { createPostJobLink } from "./postJobLinkService.js";
+import { startJobPosting } from "./postJobFlowService.js";
 
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.warn("[geminiService] GEMINI_API_KEY is not set in .env");
@@ -22,6 +25,18 @@ const ai = new GoogleGenAI({ apiKey });
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const APPLICATIONS_TABLE = "applications"; // expects: job_id, status, created_at, + a name column
+
+// Dashboard links the bot can send when WhatsApp can't do the task.
+// Defaults all open the business dashboard. If your dashboard opens a specific tab from
+// the URL, set these in .env (e.g. DASH_PATH_APPLICANTS=/business/dashboard?tab=applicants).
+const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
+const DASHBOARD_PATHS = {
+  overview: process.env.DASH_PATH_OVERVIEW || "/business/dashboard",
+  post_job: process.env.DASH_PATH_POST_JOB || "/business/dashboard",
+  jobs: process.env.DASH_PATH_JOBS || "/business/dashboard",
+  applicants: process.env.DASH_PATH_APPLICANTS || "/business/dashboard",
+  profile: process.env.DASH_PATH_PROFILE || "/business/dashboard",
+};
 
 // Only these business_profiles fields are ever shown to Gemini.
 // (Never nin_number, phone, phone_verification_code, etc.)
@@ -93,19 +108,27 @@ const tools = [
         },
       },
       {
-        name: "createPostJobLink",
+        name: "startJobPosting",
         description:
-          "Create a secure link where the owner can post a new job on the JobNix website. " +
-          "Use when they want to post, create or advertise a job or hire someone. " +
-          "Pass any details they already mentioned so the form is pre-filled. Do not ask for more details first.",
+          "Start posting a new job here in WhatsApp. Use when the owner wants to post, create or " +
+          "advertise a job or hire someone. Takes no arguments. Do not ask them for details first: " +
+          "the questions are asked automatically after this.",
+        parameters: { type: "object", properties: {} },
+      },
+      {
+        name: "getDashboardLink",
+        description:
+          "Get the link to the JobNix business dashboard. Use it when the owner wants something " +
+          "WhatsApp cannot do (edit or delete a job, review or contact applicants, update the business " +
+          "profile, see payments) or when they ask to post a job on the website or dashboard instead of WhatsApp.",
         parameters: {
           type: "object",
           properties: {
-            title: { type: "string", description: "Job title, e.g. Cleaner" },
-            location: { type: "string", description: "Job location, e.g. Yaba, Lagos" },
-            pay_type: { type: "string", enum: ["Daily", "Weekly", "Monthly", "Per job"] },
-            pay_amount: { type: "string", description: "Pay amount as the user said it, e.g. 5000" },
-            workers_needed: { type: "integer", description: "Number of workers, 1 to 10" },
+            section: {
+              type: "string",
+              enum: ["overview", "post_job", "jobs", "applicants", "profile"],
+              description: "Which part of the dashboard they need",
+            },
           },
         },
       },
@@ -327,14 +350,20 @@ async function getApplicationsSummary(businessId, { period } = {}) {
   };
 }
 
+function getDashboardLink({ section } = {}) {
+  const key = DASHBOARD_PATHS[section] ? section : "overview";
+  return { section: key, link: `${FRONTEND_URL}${DASHBOARD_PATHS[key]}` };
+}
+
 async function functionRouter(businessId, name, args) {
   try {
+    if (name === "getDashboardLink") return getDashboardLink(args);
     if (name === "getBusinessOverview") return await getBusinessOverview(businessId);
     if (name === "listJobs") return await listJobs(businessId, args);
     if (name === "getJobStats") return await getJobStats(businessId, args.jobTitle);
     if (name === "listApplicants") return await listApplicants(businessId, args);
     if (name === "getApplicationsSummary") return await getApplicationsSummary(businessId, args);
-    if (name === "createPostJobLink") return await createPostJobLink(businessId, args);
+    if (name === "startJobPosting") return await startJobPosting(businessId);
     return { error: "unknown_function" };
   } catch (err) {
     console.error(`[geminiService] tool ${name} failed:`, err);
@@ -372,25 +401,28 @@ function buildSystemInstruction() {
     "You are the JobNix WhatsApp assistant for business owners. " +
     `Today is ${today} (Lagos time). ` +
     "You can report on: whether they have posted jobs, each job's state, views, clicks and applications, " +
-    "who applied, and how many applied today, this week or this month. " +
+    "who applied, and how many applied today, this week or this month. You can also start posting a new job. " +
     "Job states: live = approved and open; expired = approved but past its closing date; " +
-    "pending = submitted and waiting for JobNix admin approval; draft = saved but not submitted; " +
+    "pending = submitted and waiting for JobNix admin approval; draft = saved but not submitted or not yet paid; " +
     "rejected = declined by admin (a rejectionReason may be given). " +
     "RULES: " +
     "1) For greetings or small talk, reply in one or two friendly lines and say what they can ask. Call no tool. " +
     "2) For any question about their business, jobs or applicants, ALWAYS call the right tool first. " +
     "Never guess or invent numbers, names or reasons. " +
-    "3) If hasPostedJobs is false, say they haven't posted a job yet (mention drafts if draftJobs > 0) and suggest posting from the dashboard. " +
+    "3) If hasPostedJobs is false, say they haven't posted a job yet (mention drafts if draftJobs > 0) and offer to post one right here (they just send 'post a job') or on their dashboard. " +
     "4) If they have jobs but zero applications, say so clearly and mention which job has the most views if useful. " +
     "5) If a job is pending, explain it is awaiting admin approval and won't get views until approved. " +
     "If rejected, share the rejectionReason if there is one. " +
     "6) If a job title isn't found, say so and offer to list their jobs. If several jobs match, list them and ask which one. " +
     "7) If a tool returns detailsUnavailable or periodUnavailable, give the counts you do have and say applicant names or dates aren't available right now. " +
     "8) If a tool returns an error, apologise briefly and ask them to try again. " +
-    "9) If they want to post a job, call createPostJobLink right away with any details they gave, then send the link " +
-    "on its own line, say it works for about 30 minutes, and that they finish the details and payment on the website. " +
-    "Never take payment or promise a price in chat. " +
-    "10) You cannot edit or delete jobs, or message applicants. Say so and list what you can do. " +
+    "9) If they want to post a job, call startJobPosting and reply with its firstMessage exactly as given, word for word. " +
+    "The questions, price and payment link are handled automatically after that. Never quote a price yourself. " +
+    "If they say they want to post on the website or dashboard instead, call getDashboardLink with section post_job " +
+    "and send the link on its own line. " +
+    "10) You cannot edit or delete jobs, review or message applicants, change the business profile, or see payment history in WhatsApp. " +
+    "When they ask for any of these, call getDashboardLink with the closest section, send the link on its own line " +
+    "and say in one short line that they can do it there after logging in. Never invent a link yourself. " +
     "Style: short, friendly plain text for WhatsApp. No markdown tables or headings. Simple • bullets are fine. " +
     "Never mention tools, databases or function names."
   );

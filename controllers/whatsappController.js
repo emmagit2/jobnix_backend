@@ -4,6 +4,8 @@ import twilio from "twilio";
 import { supabase } from "../config/supabase.js";
 import * as whatsappService from "../services/whatsappService.js";
 import * as geminiService from "../services/geminiService.js";
+import * as postJobFlow from "../services/postJobFlowService.js";
+import { getLoginNudge } from "../services/loginNudgeService.js";
 import * as businessProfilesRepo from "../lib/businessProfilesRepo.js";
 
 // "twiml": replies go back inside the webhook response (works in the Twilio sandbox).
@@ -61,27 +63,49 @@ export const receiveMessage = async (req, res) => {
       }
     }
 
-    // ── 2. Normal business-question message ──
+    // ── 2. Normal business message ──
     const business = await businessProfilesRepo.findByPhone(`+${inbound.from}`);
 
     if (!business) {
       await reply(
-        "This WhatsApp number isn't linked to a verified JobNix business account yet. " +
-          "Please add and verify your phone number from your Business Dashboard settings."
+        "Hi! To post a job or check your jobs on JobNix, you first need a business account.\n\n" +
+          "1. Sign up at https://jobnix.ng (choose Business)\n" +
+          "2. In Business Profile settings, add and verify this WhatsApp number\n" +
+          '3. Come back here and send "Post a job"'
       );
       return;
     }
-const greeting = /^(hi|hello|hey|hell0|good (morning|afternoon|evening)|menu|help)\b/i;
-if (greeting.test(inbound.text.trim())) {
-  await reply(
-    `👋 Hi ${business.business_name || "there"}! I'm the JobNix assistant.\n\n` +
-      "Ask me things like:\n" +
-      "• List my jobs\n" +
-      "• How many views did my Marketing Intern job get?\n" +
-      "• How many applications do I have?"
-  );
-  return;
-}
+
+    // ── 2a. Job posting in progress? Handle it before anything else ──
+    const postSession = await postJobFlow.getActiveSession(business.id);
+    if (postSession) {
+      const flowReply = await postJobFlow.handlePostJobMessage(
+        business,
+        postSession,
+        inbound.text,
+        inbound.from // digits only, e.g. 2348012345678
+      );
+      await reply(flowReply);
+      return;
+    }
+
+    // ── 2b. Greeting ──
+    const greeting = /^(hi|hello|hey|hell0|good (morning|afternoon|evening)|menu|help)\b/i;
+    if (greeting.test(inbound.text.trim())) {
+      await reply(
+        `👋 Hi ${business.business_name || "there"}! I'm the JobNix assistant.\n\n` +
+          "Ask me things like:\n" +
+          "• Post a job\n" +
+          "• List my jobs\n" +
+          "• How many views did my Marketing Intern job get?\n" +
+          "• How many applications do I have?"
+      );
+      const greetNudge = await getLoginNudge(business);
+      if (greetNudge) await reply(greetNudge);
+      return;
+    }
+
+    // ── 2c. Question for Gemini ──
     const { data: recentRows, error: recentErr } = await supabase
       .from("ai_conversations")
       .select("*")
@@ -97,7 +121,11 @@ if (greeting.test(inbound.text.trim())) {
 
     const answer = await geminiService.answerBusinessQuestion(business.id, inbound.text, history);
 
-    await reply(answer);
+    // Inactive owner? Add a login reminder, but not if they just started posting a job here
+    const startedPosting = await postJobFlow.getActiveSession(business.id);
+    const nudge = startedPosting ? null : await getLoginNudge(business);
+
+    await reply(nudge ? `${answer}\n\n${nudge}` : answer);
 
     await supabase
       .from("ai_conversations")

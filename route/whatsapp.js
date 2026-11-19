@@ -1,4 +1,4 @@
- // route/whatsapp.js  (Twilio version)
+// route/whatsapp.js  (Twilio version)
 import express from "express";
 import twilio from "twilio";
 import requireAuth from "../middleware/requireAuth.js";
@@ -8,8 +8,13 @@ import {
   requestPhoneVerification,
   confirmPhoneVerification,
 } from "../controllers/whatsappController.js";
+import { nudgeCronHandler } from "../services/loginNudgeService.js";
 
 const router = express.Router();
+
+// Daily inactive-owner nudge. Called by a cron service, not by Twilio or a logged-in user,
+// so it has no Twilio signature and no login. The x-cron-secret header protects it.
+router.post("/internal/nudges/run", nudgeCronHandler);
 
 // Twilio posts inbound WhatsApp messages here as form data (not JSON).
 // twilio.webhook() rejects any request not signed by Twilio.

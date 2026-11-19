@@ -1,21 +1,29 @@
-// middleware/verifySignatures.js
-import * as whatsappService from "../services/whatsappService.js";
+// middleware/verifySignatures.js  (Twilio version)
+import twilio from "twilio";
 
-// Requires req.rawBody to have been captured by the raw-body-preserving
-// JSON parser (the express.json({ verify }) option — see integration README).
+// Twilio signs each request with your Auth Token. The signature covers the
+// exact public URL Twilio called plus the form fields, so the URL must match.
 export function verifyWhatsappSignature(req, res, next) {
-  const signature = req.headers["x-hub-signature-256"];
+  const signature = req.headers["x-twilio-signature"];
+  if (!signature) return res.sendStatus(403);
 
-  // TEMPORARY DEBUG LOGGING — remove once the webhook is confirmed working.
-  console.log("[whatsapp webhook] incoming signature header:", signature || "(missing)");
-  console.log("[whatsapp webhook] rawBody present:", !!req.rawBody, "length:", req.rawBody?.length);
-  console.log("[whatsapp webhook] APP_SECRET loaded:", !!process.env.WHATSAPP_APP_SECRET);
+  // Use your public URL (ngrok while testing, your real domain in production).
+  // Set PUBLIC_BASE_URL in .env, e.g. https://abc123.ngrok-free.app (no trailing slash).
+  const base =
+    process.env.PUBLIC_BASE_URL ||
+    `${req.headers["x-forwarded-proto"] || req.protocol}://${req.headers["x-forwarded-host"] || req.get("host")}`;
+  const url = base + req.originalUrl;
 
-  const valid = whatsappService.verifySignature(req.rawBody, signature);
-  console.log("[whatsapp webhook] signature valid:", valid);
+  const valid = twilio.validateRequest(
+    process.env.TWILIO_AUTH_TOKEN,
+    signature,
+    url,
+    req.body || {}
+  );
 
   if (!valid) {
-    return res.sendStatus(401);
+    console.error("[whatsapp webhook] invalid Twilio signature for", url);
+    return res.sendStatus(403);
   }
   next();
 }

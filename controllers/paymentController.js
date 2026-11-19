@@ -1,9 +1,10 @@
-import crypto from "crypto";
+ import crypto from "crypto";
 import { supabase } from "../config/supabase.js";
 import * as paymentsRepo from "../lib/paymentsRepo.js";
 import * as jobsRepo from "../lib/jobsRepo.js";
 import * as businessProfilesRepo from "../lib/businessProfilesRepo.js";
 import * as paystackService from "../services/paystackService.js";
+import { sendText } from "../services/whatsappService.js";
 import { PLANS, PREMIUM_SUBSCRIPTION_FEE_KOBO } from "../config/plans.js";
  
 const getBusinessEmail = async (businessId) => {
@@ -156,6 +157,12 @@ export async function initializePremiumUpgrade(req, res) {
     await businessProfilesRepo.setPlan(updated.business_id, "premium");
   } else if (updated.purpose === "informal_job") {
     await jobsRepo.markInformalJobPaid(updated.job_id, reference);
+
+    // Posted from WhatsApp? Tell the owner on WhatsApp too
+    if (tx.metadata?.whatsapp) {
+      sendText(String(tx.metadata.whatsapp), "Payment received. Your job is now being reviewed. We'll message you when it's live.")
+        .catch((e) => console.error("WhatsApp payment confirmation failed:", e.message));
+    }
   }
   return updated;
 }
