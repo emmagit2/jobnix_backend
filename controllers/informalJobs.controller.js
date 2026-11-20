@@ -15,6 +15,8 @@
 
 import { supabase } from "../config/supabase.js";
 import * as notificationService from "../services/notificationService.js";
+import messagingAdminDB from "../lib/messagingAdminDB.js";
+import { findOrCreateConversation } from "../lib/conversations.js";
 
 // Same slug generator as jobs.controller.js (kept here so this file doesn't
 // import from that one, which would be a circular import).
@@ -673,6 +675,20 @@ export const applyToInformalJob = async (req, res) => {
         .json({ success: false, message: `Your message is too long (max ${MESSAGE_MAX} characters).` });
     }
 
+    // Where the applicant is right now (same "Where are you right now?" answer the
+    // business sees on the Applicants page and in Stats).
+    const locationLabel =
+      typeof req.body?.applicant_location === "string" ? req.body.applicant_location.trim().slice(0, 200) : "";
+    const lat = req.body?.applicant_lat;
+    const lng = req.body?.applicant_lng;
+    const hasCoords =
+      typeof lat === "number" && typeof lng === "number" &&
+      Number.isFinite(lat) && Number.isFinite(lng) &&
+      Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+    if (!locationLabel && !hasCoords) {
+      return res.status(400).json({ success: false, message: "Please tell us where you are right now to apply." });
+    }
+
     const { data, error } = await supabase.rpc("apply_to_informal_job", {
       p_job_id: jobId,
       p_applicant_id: userId,
@@ -693,6 +709,54 @@ export const applyToInformalJob = async (req, res) => {
       return res
         .status(500)
         .json({ success: false, message: "Couldn't send your application. Please try again." });
+    }
+
+    // Save the location on the application row (non-fatal if it fails).
+    const { error: locErr } = await supabase
+      .from("applications")
+      .update({
+        applicant_location: locationLabel || null,
+        applicant_lat: hasCoords ? lat : null,
+        applicant_lng: hasCoords ? lng : null,
+      })
+      .eq("job_id", jobId)
+      .eq("applicant_id", userId);
+    if (locErr) console.error("[informalApplications] saving location failed (non-fatal):", locErr.message);
+
+    // Deliver the applicant's message to the business: it lands in their in-app
+    // Messages (same as formal one-click applications) and they get a notification.
+    // Non-fatal: the application is already saved, so a messaging problem must
+    // not make the applicant see an error.
+    try {
+      const { data: job } = await supabase
+        .from("jobs")
+        .select("title, submitted_by_business_id")
+        .eq("id", jobId)
+        .maybeSingle();
+
+      if (job?.submitted_by_business_id) {
+        const { conversationId, applicantName } = await findOrCreateConversation({
+          businessId: job.submitted_by_business_id,
+          applicantId: userId,
+          jobId,
+        });
+
+        const { error: msgErr } = await messagingAdminDB.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: userId,
+          content:
+            `${applicantName} applied for "${job.title}"` +
+            (locationLabel ? ` \u2014 currently in ${locationLabel}.` : ".") +
+            (message ? `\n\n${message}` : ""),
+        });
+        if (msgErr) throw msgErr;
+
+        if (typeof notificationService.notifyNewApplicant === "function") {
+          await notificationService.notifyNewApplicant(job.submitted_by_business_id, job.title, applicantName);
+        }
+      }
+    } catch (chatErr) {
+      console.error("[informalApplications] message/notify failed (non-fatal):", chatErr.message);
     }
 
     return res.status(201).json({ success: true, data });

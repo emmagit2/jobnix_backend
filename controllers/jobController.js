@@ -1,4 +1,4 @@
- import { supabase } from "../config/supabase.js";
+import { supabase } from "../config/supabase.js";
 import messagingAdminDB from "../lib/messagingAdminDB.js";
 import * as notificationService from "../services/notificationService.js";
 import * as jobsRepo from "../lib/jobsRepo.js"; 
@@ -918,7 +918,7 @@ export const getMyInformalApplicants = async (req, res) => {
     // "Where are you right now?" popup
     const { data: apps, error: appsErr } = await supabase
       .from("applications")
-      .select("id, job_id, applicant_id, status, applied_at, applicant_location, applicant_lat, applicant_lng")
+      .select("id, job_id, applicant_id, status, applied_at, message, applicant_location, applicant_lat, applicant_lng")
       .in("job_id", jobs.map((j) => j.id))
       .order("applied_at", { ascending: false });
     if (appsErr) throw appsErr;
@@ -956,6 +956,7 @@ export const getMyInformalApplicants = async (req, res) => {
         id: a.id,
         status: a.status === "applied" ? "pending" : a.status,
         applied_at: a.applied_at,
+        message: a.message || "", // what the applicant wrote when applying
 
         // the job they applied for
         job_id: a.job_id,
@@ -987,7 +988,21 @@ export const getMyInformalApplicants = async (req, res) => {
   }
 };
 
-// ─── Accept / reject / reset one applicant ───────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// PATCH for jobs.controller.js  (two small edits)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── EDIT 1 ─ getJobApplicants: the column is applied_at, not created_at ─────
+// Find:
+//     .order("created_at", { ascending: false });
+// (inside getJobApplicants) and change it to:
+//     .order("applied_at", { ascending: false });
+
+
+// ── EDIT 2 ─ REPLACE the whole updateApplicantStatus function ───────────────
+// Same as before, plus: when you Accept or Reject someone, they get a message
+// in their in-app chat. Moving back to "pending" sends nothing. A failed
+// message never makes the accept/reject fail.
 export const updateApplicantStatus = async (req, res) => {
   try {
     const { applicationId } = req.params;
@@ -998,7 +1013,7 @@ export const updateApplicantStatus = async (req, res) => {
 
     const { data: app, error } = await supabase
       .from("applications")
-      .select("id, jobs ( work_type, submitted_by_business_id )")
+      .select("id, applicant_id, job_id, status, jobs ( title, work_type, submitted_by_business_id )")
       .eq("id", applicationId)
       .maybeSingle();
     if (error) throw error;
@@ -1008,8 +1023,35 @@ export const updateApplicantStatus = async (req, res) => {
       return res.status(404).json({ success: false, message: "Application not found" });
     }
 
+    const changed = app.status !== dbStatus;
+
     const { error: updErr } = await supabase.from("applications").update({ status: dbStatus }).eq("id", applicationId);
     if (updErr) throw updErr;
+
+    // Tell the applicant (non-fatal)
+    if (changed && (dbStatus === "accepted" || dbStatus === "rejected")) {
+      try {
+        const { conversationId } = await findOrCreateConversation({
+          businessId: req.businessId,
+          applicantId: app.applicant_id,
+          jobId: app.job_id,
+        });
+
+        const content =
+          dbStatus === "accepted"
+            ? `Good news: your application for "${app.jobs.title}" was accepted. Reply here to agree on the next steps.`
+            : `Thank you for applying for "${app.jobs.title}". The business has decided not to go ahead with your application this time.`;
+
+        const { error: msgErr } = await messagingAdminDB.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: req.businessId,
+          content,
+        });
+        if (msgErr) throw msgErr;
+      } catch (chatErr) {
+        console.error("updateApplicantStatus: couldn't message applicant (non-fatal):", chatErr.message);
+      }
+    }
 
     res.json({ success: true, data: { id: applicationId, status: req.body.status } });
   } catch (err) {
@@ -1266,4 +1308,4 @@ export const publishAdminDraft = async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
-}; 
+};
