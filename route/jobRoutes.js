@@ -30,6 +30,12 @@ import {
   publishAdminDraft,
   deleteAdminDraft,
 } from "../controllers/jobController.js";
+// Job seeker applies to an informal job on Jobnix; business takes an informal job down.
+import {
+  applyToInformalJob,
+  getMyInformalApplications,
+  setInformalJobTakenDown,
+} from "../controllers/informalJobs.controller.js";
 import adminCheck from "../middleware/adminCheck.js";
 import requireAuth from "../middleware/requireAuth.js";
 import requireBusinessAccount from "../middleware/requireBusinessAccount.js";
@@ -40,11 +46,15 @@ const router = express.Router();
 // PUBLIC / BUSINESS ROUTES
 // =============================
 // Single-segment paths ("/mine", "/applicants", "/analytics", "/informal",
-// "/pending", "/drafts") MUST all be registered before the generic "/:id"
-// below — otherwise Express matches them as GET/POST /:id with
-// id="mine"/"applicants"/"analytics"/"drafts"... and the real handler never runs.
+// "/pending", "/drafts", "/my-informal-applications") MUST all be registered
+// before the generic "/:id" below — otherwise Express matches them as
+// GET/POST /:id with id="mine"/"applicants"/"analytics"/"drafts"... and the
+// real handler never runs.
 
 router.get("/mine", [requireAuth, requireBusinessAccount], getMyJobs);
+
+// Job seeker: the informal jobs I applied for (powers the Applied marks on the My CV page).
+router.get("/my-informal-applications", requireAuth, getMyInformalApplications);
 
 // Business dashboard: every applicant across MY informal jobs, accept/reject
 // one of them, and open an in-app chat with them.
@@ -66,6 +76,14 @@ router.post("/informal", [requireAuth, requireBusinessAccount], submitInformalJo
 // checked inside the controller (submitted_by_business_id === req.businessId).
 router.patch("/informal/:id", [requireAuth, requireBusinessAccount], updateInformalJob);
 router.delete("/informal/:id", [requireAuth, requireBusinessAccount], deleteInformalJob);
+
+// Business: take an informal job down (people can no longer apply) or put it back up.
+// Ownership is checked inside the controller.
+router.patch("/informal/:id/takedown", [requireAuth, requireBusinessAccount], setInformalJobTakenDown);
+
+// Job seeker: apply to an informal job on Jobnix. The application goes to the
+// business that posted it. (Informal jobs never use email or an outside link.)
+router.post("/informal/:id/apply", requireAuth, applyToInformalJob);
 
 // Admin queue: informal jobs that are paid and awaiting review.
 router.get("/pending", requireAuth, adminCheck, getPendingJobs);

@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// controllers/informalJobs.controller.js  (NEW FILE)
+// controllers/informalJobs.controller.js  (ONE file: posting + applying)
 //
 // Everything about informal jobs that changed: areas, informal pay, duration
 // plans (3 weeks / 1 month / 2 months), workers needed (+₦500 for 2 or 3),
@@ -10,6 +10,7 @@
 // rejectJob, getMyJobs
 //
 // Run jobnix-informal-migration.sql in Supabase BEFORE deploying this.
+// Also holds: applyToInformalJob, getMyInformalApplications, setInformalJobTakenDown
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { supabase } from "../config/supabase.js";
@@ -632,5 +633,172 @@ export const getMyJobs = async (req, res) => {
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APPLYING TO INFORMAL JOBS (job seekers) + TAKE DOWN (business)
+// Informal jobs ALWAYS apply on Jobnix; the application goes into the
+// applications table, where the business that posted the job sees it.
+// Needs informal-apply.sql run in Supabase.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// CHANGE THIS if your requireAuth middleware names the user differently.
+const currentUserId = (req) => req.user?.id || req.userId || null;
+
+const MESSAGE_MAX = 500;
+
+const KNOWN_ERRORS = {
+  JOB_NOT_FOUND: [404, "This job couldn't be found."],
+  NOT_INFORMAL: [400, "This job can't be applied for here."],
+  JOB_CLOSED: [410, "This job is no longer open."],
+  JOB_TAKEN_DOWN: [410, "The business has stopped taking applications for this job."],
+  NO_PROFILE: [400, "Please finish setting up your profile before applying."],
+  ALREADY_APPLIED: [409, "You've already applied for this job."],
+};
+
+// POST /jobs/informal/:id/apply   body: { message? }
+export const applyToInformalJob = async (req, res) => {
+  try {
+    const userId = currentUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Please sign in to apply." });
+    }
+
+    const jobId = req.params.id;
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    if (message.length > MESSAGE_MAX) {
+      return res
+        .status(400)
+        .json({ success: false, message: `Your message is too long (max ${MESSAGE_MAX} characters).` });
+    }
+
+    const { data, error } = await supabase.rpc("apply_to_informal_job", {
+      p_job_id: jobId,
+      p_applicant_id: userId,
+      p_message: message || null,
+    });
+
+    if (error) {
+      const code = Object.keys(KNOWN_ERRORS).find((c) => String(error.message || "").includes(c));
+      if (code) {
+        const [status, text] = KNOWN_ERRORS[code];
+        return res.status(status).json({ success: false, message: text });
+      }
+      // 22P02 = the id in the URL isn't a valid uuid
+      if (error.code === "22P02") {
+        return res.status(404).json({ success: false, message: KNOWN_ERRORS.JOB_NOT_FOUND[1] });
+      }
+      console.error("[informalApplications] apply failed:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Couldn't send your application. Please try again." });
+    }
+
+    return res.status(201).json({ success: true, data });
+  } catch (err) {
+    console.error("[informalApplications] apply failed:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Couldn't send your application. Please try again." });
+  }
+};
+
+// GET /jobs/my-informal-applications
+// Returns { id, job_id, status, applied_at, message, job: {...} } rows,
+// the shape MyCvPage.jsx expects.
+export const getMyInformalApplications = async (req, res) => {
+  try {
+    const userId = currentUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Please sign in." });
+    }
+
+    const { data, error } = await supabase
+      .from("applications")
+      .select(
+        "id, job_id, status, applied_at, message, " +
+          "jobs!inner(id, title, location, pay_amount, pay_type, work_type, " +
+          "companies(name, logo_url), " +
+          "business_profiles!jobs_submitted_by_business_id_fkey(business_name))"
+      )
+      .eq("applicant_id", userId)
+      .eq("jobs.work_type", "informal")
+      .order("applied_at", { ascending: false });
+
+    if (error) throw error;
+
+    const rows = (data || []).map(({ jobs, ...rest }) => ({
+      ...rest,
+      job: jobs
+        ? {
+            id: jobs.id,
+            title: jobs.title,
+            location: jobs.location,
+            pay_amount: jobs.pay_amount,
+            pay_type: jobs.pay_type,
+            // Informal jobs have no company_id: the name is the posting business's name
+            company: jobs.business_profiles?.business_name || jobs.companies?.name || "",
+          }
+        : null,
+    }));
+
+    return res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error("[informalApplications] list failed:", err);
+    return res.status(500).json({ success: false, message: "Couldn't load your applications." });
+  }
+};
+
+// PATCH /jobs/informal/:id/takedown   body: { down: true | false }
+// The business that posted the job takes it down (stops applications) or puts it back up.
+// Nothing else changes: the job keeps its status, end date and payment.
+export const setInformalJobTakenDown = async (req, res) => {
+  try {
+    if (!req.businessId) {
+      return res.status(401).json({ success: false, message: "Must be logged in as a business" });
+    }
+    if (typeof req.body?.down !== "boolean") {
+      return res.status(400).json({ success: false, message: "Say whether to take the job down or put it back up." });
+    }
+
+    const { data: job, error: fetchErr } = await supabase
+      .from("jobs")
+      .select("id, work_type, submitted_by_business_id, expires_at")
+      .eq("id", req.params.id)
+      .maybeSingle();
+    if (fetchErr) throw fetchErr;
+
+    // 404 (not 403) so we don't reveal that someone else's job exists
+    if (!job || job.work_type !== "informal" || job.submitted_by_business_id !== req.businessId) {
+      return res.status(404).json({ success: false, message: "Job not found" });
+    }
+
+    // A job whose time has ended can't be put back up (post it again instead)
+    if (!req.body.down && job.expires_at && new Date(job.expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: "This job's time has ended, so it can't be put back up. Post it again as a new job.",
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("jobs")
+      .update({ taken_down_at: req.body.down ? new Date().toISOString() : null })
+      .eq("id", job.id)
+      .select("id, taken_down_at")
+      .single();
+    if (error) throw error;
+
+    return res.json({
+      success: true,
+      data,
+      message: req.body.down
+        ? "Job taken down. People can no longer apply. Applications you already have stay in your Applicants tab."
+        : "Job is back up. People can apply again.",
+    });
+  } catch (err) {
+    console.error("[informalApplications] take down failed:", err);
+    return res.status(500).json({ success: false, message: "Couldn't update the job. Please try again." });
   }
 };
