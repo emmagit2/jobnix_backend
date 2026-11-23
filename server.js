@@ -1,4 +1,4 @@
-process.on("unhandledRejection", (reason) => {
+ process.on("unhandledRejection", (reason) => {
   console.error("UNHANDLED REJECTION — full detail:");
   console.error(reason);
 });
@@ -23,7 +23,7 @@ import recruiterHubRoutes from "./route/recruiterHub.js"; // one dashboard — e
 import userMessagesRoutes from "./route/userMessages.js";
 import emailsRouter from "./route/emails.routes.js";
 import { supabase } from "./config/supabase.js";
- 
+
 import whatsappRoutes from "./route/whatsapp.js";
 import paymentRoutes from "./route/paymentRoutes.js";
 import accountRoutes from "./route/accountRoutes.js";
@@ -38,10 +38,10 @@ import businessVerificationRoutes from "./route/businessVerification.js";
 import { getMyMatchedJobs } from "./controllers/jobMatchController.js";
 import requireAuth from "./middleware/requireAuth.js";
 
-
 dotenv.config();
 
 const app = express();
+app.set("trust proxy", 1); // Render sits behind a proxy; needed so rate limiting sees real IPs
 
 // ── CORS ──────────────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
@@ -61,9 +61,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 // Capture the raw request body so WhatsApp/Paystack webhook signatures can
-// be verified against the exact bytes Meta/Paystack sent — verifying
-// against a re-serialized JSON object would fail. (Carried over from the
-// old createApp() factory — needed for whatsappService.verifySignature.)
+// be verified against the exact bytes Meta/Paystack sent.
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -74,25 +72,9 @@ app.use(
 app.use(cookieParser());
 
 // ── Public guest messaging — MUST be mounted before "/api/messages" ─────
-// userMessagesRoutes runs `router.use(requireAuth)`, so it rejects any
-// unauthenticated request under /api/messages with a 401 before Express can
-// reach a router mounted after it. guestMessagesRoutes defines its own full
-// paths (/api/messages/guest-send, /api/messages/guest/:token, ...) and is
-// deliberately public (guests have no login), so it has to be registered
-// first or guest send/reply can never work.
 app.use(guestMessagesRoutes);
 
 // ── More specific mounts first ───────────────────────────────────────────
-// Several routers below are mounted at the broad "/api" path rather than a
-// specific sub-path. Express matches middleware strictly in registration
-// order, and if one of those routers has its own catch-all fallback (e.g.
-// `router.use((req, res) => res.status(404)...)`), it will swallow ANY
-// unmatched "/api/*" request — including ones meant for routers mounted
-// later, like paymentRoutes. Mounting the specific ones first guarantees
-// they get first crack at matching before a broader router's fallback can
-// intercept the request. This was the actual cause of
-// /api/payments/informal-job/initialize 404ing even though paymentRoutes.js
-// itself had the correct route defined.
 app.use("/api/payments", paymentRoutes);
 app.use("/api/whatsapp", whatsappRoutes);
 app.use("/api/account", accountRoutes);
@@ -135,9 +117,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ─── DB keep-alive ping — hits Supabase directly so both Render AND
-// the Supabase connection pool stay warm. Point UptimeRobot here
-// instead of (or in addition to) /health. ─────────────────────────
+// ─── DB keep-alive ping ─────────────────────────────────────────────────
 app.get("/api/ping-db", async (req, res) => {
   try {
     const { error } = await supabase.from("jobs").select("id").limit(1);

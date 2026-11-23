@@ -1,6 +1,4 @@
- 
-
-import { supabase } from "../config/supabase.js"; // service-role client
+ import { supabase } from "../config/supabase.js"; // service-role client
 import crypto from "crypto";
 import jwt from "jsonwebtoken"; // npm install jsonwebtoken
 import { sendEmail } from "../lib/email.js";
@@ -11,18 +9,22 @@ import {
 } from "../lib/emailTemplates.js";
 import * as notificationService from "../services/notificationService.js";
 
-// ➕ NEW: in-app messaging (DB2) for informal-job applications
+// in-app messaging (DB2) for informal-job applications
 import { findOrCreateConversation } from "../lib/conversations.js";
 import messagingAdminDB from "../lib/messagingAdminDB.js";
 
 // =============================
 // POST /applications
-// One-click ("platform") or logging an ("email") apply.
+// One-click ("platform") apply, or starting to track an ("external") apply.
 //
-// Informal jobs: requires the applicant's current location, saves it on the
-// application row, then opens an in-app conversation with the poster and
-// drops an "applied" message into it, so the business sees the applicant in
-// their inbox right away. Formal jobs are unchanged.
+// "platform" — informal jobs: requires the applicant's current location, saves
+// it, opens an in-app conversation with the poster and drops an "applied"
+// message into it. Formal jobs: unchanged.
+//
+// "external" (NEW) — the user clicked through to the employer's own website.
+// We save a row with confirmed = false so they get a tracking email
+// (<tracking_code>@track.jobnix.com). Nothing is sent to the employer.
+// Email applications go through the apply-by-email route, not this one.
 // =============================
 export const createApplication = async (req, res) => {
   const applicantId = req.user.id;
@@ -34,12 +36,12 @@ export const createApplication = async (req, res) => {
   if (!job_id || !method) {
     return res.status(400).json({ message: "job_id and method are required" });
   }
-   
+
   if (method === "email") {
     return res.status(400).json({ message: "Email applications must be sent through the apply-by-email route." });
   }
-  if (method !== "platform") {
-    return res.status(400).json({ message: "method must be 'platform'" });
+  if (method !== "platform" && method !== "external") {
+    return res.status(400).json({ message: "method must be 'platform' or 'external'" });
   }
 
   const { data: job } = await supabase
@@ -49,6 +51,35 @@ export const createApplication = async (req, res) => {
     .maybeSingle();
 
   if (!job) return res.status(404).json({ message: "Job not found" });
+
+  // ─────────────── EXTERNAL WEBSITE (tracking only) ───────────────
+  if (method === "external") {
+    if (job.work_type === "informal") {
+      return res.status(400).json({ message: "External tracking is only for company-website jobs." });
+    }
+
+    // Already have a row for this job? Return it untouched (never overwrite
+    // a platform/email application, or reset a confirmed one).
+    const { data: existing } = await supabase
+      .from("applications").select("*")
+      .eq("job_id", job_id).eq("applicant_id", applicantId).maybeSingle();
+    if (existing) return res.status(200).json({ data: existing });
+
+    const { data: row, error: extErr } = await supabase
+      .from("applications")
+      .insert({
+        job_id,
+        applicant_id: applicantId,
+        method: "external",
+        status: "applied",
+        confirmed: false, // set by the server, never trusted from the client
+        applied_at: new Date().toISOString(),
+      })
+      .select().single();
+    if (extErr) return res.status(500).json({ message: extErr.message });
+
+    return res.status(201).json({ data: row });
+  }
 
   // ─────────────── INFORMAL JOBS (always one-click) ───────────────
   if (job.work_type === "informal") {
@@ -175,9 +206,39 @@ export const createApplication = async (req, res) => {
 };
 
 // =============================
+// PATCH /applications/:id/confirm   (NEW)
+// The user says "Yes, I applied" for an external application.
+// Scoped to the signed-in user's own external applications only, and it
+// changes nothing but the `confirmed` flag.
+// =============================
+export const confirmApplication = async (req, res) => {
+  const applicantId = req.user.id;
+  const { id } = req.params;
+  const { confirmed } = req.body;
+
+  if (typeof confirmed !== "boolean") {
+    return res.status(400).json({ message: "confirmed must be true or false" });
+  }
+
+  const { data, error } = await supabase
+    .from("applications")
+    .update({ confirmed })
+    .eq("id", id)
+    .eq("applicant_id", applicantId)
+    .eq("method", "external")
+    .select()
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ message: error.message });
+  if (!data) return res.status(404).json({ message: "Application not found" });
+  return res.json({ data });
+};
+
+// =============================
 // GET /applications/job/:jobId
 // The signed-in user's own application for one job — powers the
-// "Applied" vs "Apply Now" state in JobApplyButton.
+// "Applied" vs "Apply Now" state, and the tracking card.
+// select("*") already includes tracking_code and confirmed.
 // =============================
 export const getApplicationForJob = async (req, res) => {
   const applicantId = req.user.id;
@@ -199,24 +260,36 @@ export const getApplicationForJob = async (req, res) => {
 // GET /applications/me
 // All of the signed-in user's applications, with job details joined in —
 // powers the "My Applications" page.
-// Also pulls work_type (for the Corporate/Informal split) and the job's
-// company name + logo_url, so the frontend can render the company logo
-// instead of falling back to an initial letter.
+// Also pulls work_type (for the Corporate/Informal split), the job's company
+// name + logo_url, and (NEW) tracking_code, confirmed, the job's apply_link,
+// and the employer emails detected on each application.
 // =============================
 export const getMyApplications = async (req, res) => {
   const applicantId = req.user.id;
 
-  const { data, error } = await supabase
-    .from("applications")
-    .select(`
-      id, method, status, applied_at,
-      jobs (
-        id, title, company_id, role_category, location, work_type,
+  const JOB = `jobs (
+        id, title, company_id, role_category, location, work_type, apply_link,
         companies ( name, logo_url )
-      )
-    `)
+      )`;
+  const BASE = `id, method, status, applied_at, tracking_code, confirmed, ${JOB}`;
+
+  // First try with the detected employer emails. If that relationship isn't
+  // available yet (schema cache not reloaded, table missing...), fall back to
+  // the plain list so the user's applications ALWAYS show up.
+  let { data, error } = await supabase
+    .from("applications")
+    .select(`${BASE}, application_emails ( type, received_at )`)
     .eq("applicant_id", applicantId)
     .order("applied_at", { ascending: false });
+
+  if (error) {
+    console.error("getMyApplications (with emails) failed, retrying without:", error.message);
+    ({ data, error } = await supabase
+      .from("applications")
+      .select(BASE)
+      .eq("applicant_id", applicantId)
+      .order("applied_at", { ascending: false }));
+  }
 
   if (error) return res.status(500).json({ message: error.message });
   return res.json({ data });
