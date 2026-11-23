@@ -21,7 +21,7 @@ import messagingAdminDB from "../lib/messagingAdminDB.js";
 // it, opens an in-app conversation with the poster and drops an "applied"
 // message into it. Formal jobs: unchanged.
 //
-// "external" (NEW) — the user clicked through to the employer's own website.
+// "external" — the user clicked through to the employer's own website.
 // We save a row with confirmed = false so they get a tracking email
 // (<tracking_code>@track.jobnix.com). Nothing is sent to the employer.
 // Email applications go through the apply-by-email route, not this one.
@@ -58,12 +58,24 @@ export const createApplication = async (req, res) => {
       return res.status(400).json({ message: "External tracking is only for company-website jobs." });
     }
 
-    // Already have a row for this job? Return it untouched (never overwrite
-    // a platform/email application, or reset a confirmed one).
     const { data: existing } = await supabase
       .from("applications").select("*")
       .eq("job_id", job_id).eq("applicant_id", applicantId).maybeSingle();
-    if (existing) return res.status(200).json({ data: existing });
+
+    if (existing) {
+      // Only re-arm an unanswered external row. Never touch platform/email
+      // applications or ones the user already confirmed.
+      if (existing.method === "external" && existing.confirmed === false) {
+        const { data: refreshed, error: refErr } = await supabase
+          .from("applications")
+          .update({ applied_at: new Date().toISOString() })
+          .eq("id", existing.id)
+          .select().single();
+        if (refErr) return res.status(500).json({ message: refErr.message });
+        return res.status(200).json({ data: refreshed });
+      }
+      return res.status(200).json({ data: existing });
+    }
 
     const { data: row, error: extErr } = await supabase
       .from("applications")
@@ -206,7 +218,7 @@ export const createApplication = async (req, res) => {
 };
 
 // =============================
-// PATCH /applications/:id/confirm   (NEW)
+// PATCH /applications/:id/confirm
 // The user says "Yes, I applied" for an external application.
 // Scoped to the signed-in user's own external applications only, and it
 // changes nothing but the `confirmed` flag.
@@ -261,7 +273,7 @@ export const getApplicationForJob = async (req, res) => {
 // All of the signed-in user's applications, with job details joined in —
 // powers the "My Applications" page.
 // Also pulls work_type (for the Corporate/Informal split), the job's company
-// name + logo_url, and (NEW) tracking_code, confirmed, the job's apply_link,
+// name + logo_url, and tracking_code, confirmed, the job's apply_link,
 // and the employer emails detected on each application.
 // =============================
 export const getMyApplications = async (req, res) => {
@@ -579,4 +591,22 @@ export const getRecruiterApplications = async (req, res) => {
 
   if (error) return res.status(500).json({ message: error.message });
   return res.json({ data: applications });
+};
+
+// =============================
+// DELETE /applications/:id  — "No, I didn't apply"
+// Only deletes the signed-in user's own unconfirmed external rows.
+// =============================
+export const discardExternalApplication = async (req, res) => {
+  const { error, count } = await supabase
+    .from("applications")
+    .delete({ count: "exact" })
+    .eq("id", req.params.id)
+    .eq("applicant_id", req.user.id)
+    .eq("method", "external")
+    .eq("confirmed", false);
+
+  if (error) return res.status(500).json({ message: error.message });
+  if (!count) return res.status(404).json({ message: "Nothing to discard" });
+  return res.json({ ok: true });
 };

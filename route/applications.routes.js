@@ -1,10 +1,11 @@
- import { Router } from "express";
+import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import requireAuth from "../middleware/requireAuth.js";
 import adminCheck from "../middleware/adminCheck.js";
 import {
   createApplication,
   confirmApplication,
+  discardExternalApplication, // NEW
   getApplicationForJob,
   getMyApplications,
   getAllApplicationsAdmin,
@@ -32,6 +33,7 @@ router.post("/applications", requireAuth, createApplication);
 router.get("/applications/me", requireAuth, getMyApplications); // must stay before any /:id route
 router.get("/applications/job/:jobId", requireAuth, getApplicationForJob);
 router.patch("/applications/:id/confirm", requireAuth, confirmApplication);
+router.delete("/applications/:id", requireAuth, discardExternalApplication); // NEW: "No, I didn't apply"
 
 // Admin dashboard: needs a signed-in admin (role check happens in adminCheck)
 router.get("/admin/applications", adminCheck, getAllApplicationsAdmin);
