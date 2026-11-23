@@ -1,6 +1,7 @@
  import express from "express";
 import {
   getJobs,
+  getJobCounts, // NEW: real totals for the dashboard
   getJobById,
   createJob,
   updateJob,
@@ -46,12 +47,16 @@ const router = express.Router();
 // PUBLIC / BUSINESS ROUTES
 // =============================
 // Single-segment paths ("/mine", "/applicants", "/analytics", "/informal",
-// "/pending", "/drafts", "/my-informal-applications") MUST all be registered
-// before the generic "/:id" below — otherwise Express matches them as
-// GET/POST /:id with id="mine"/"applicants"/"analytics"/"drafts"... and the
-// real handler never runs.
+// "/pending", "/drafts", "/counts", "/my-informal-applications") MUST all be
+// registered before the generic "/:id" below — otherwise Express matches them
+// as GET/POST /:id with id="mine"/"applicants"/"analytics"/"drafts"/"counts"...
+// and the real handler never runs.
 
 router.get("/mine", [requireAuth, requireBusinessAccount], getMyJobs);
+
+// Real job totals (total / active / expired / featured) — not limited to 1000.
+// MUST stay above "/:id".
+router.get("/counts", getJobCounts);
 
 // Job seeker: the informal jobs I applied for (powers the Applied marks on the My CV page).
 router.get("/my-informal-applications", requireAuth, getMyInformalApplications);

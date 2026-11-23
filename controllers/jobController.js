@@ -175,29 +175,72 @@ const resolveBusinessIdForJob = async (job) => {
   return guest?.merged_user_id || null;
 };
 
+// =============================================================================
+// PASTE THIS IN jobs.controller.js
+//
+// 1. DELETE the whole old `export const getJobs = async (req, res) => { ... };`
+//    (the block that starts with "// ─── GET ALL JOBS").
+// 2. PASTE everything below in the same place.
+// =============================================================================
+
+// ─── Helpers: get past Supabase's 1000-row limit ─────────────────────────────
+
+// Keeps fetching pages of 1000 until there are no more rows.
+const fetchAll = async (buildQuery) => {
+  const pageSize = 1000;
+  let from = 0;
+  const all = [];
+  while (true) {
+    const { data, error } = await buildQuery().range(from, from + pageSize - 1);
+    if (error) throw error;
+    all.push(...data);
+    if (data.length < pageSize) break;
+    from += pageSize;
+  }
+  return all;
+};
+
+// Splits a long list of ids into small groups so the request URL stays short.
+const chunk = (arr, n = 200) =>
+  Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+
+// Loads tag rows for many jobs, 200 job ids at a time.
+const fetchTags = async (table, ids) => {
+  const parts = await Promise.all(
+    chunk(ids).map((c) =>
+      supabase.from(table).select("*").in("job_id", c).order("sort_order")
+    )
+  );
+  for (const p of parts) if (p.error) throw p.error;
+  return parts.flatMap((p) => p.data || []);
+};
+
 // ─── GET ALL JOBS ─────────────────────────────────────────────────────────────
 // Only approved jobs that have not ended. Pending/rejected/draft are hidden.
 export const getJobs = async (req, res) => {
   try {
-    const { data: jobs, error } = await supabase
-      .from("jobs")
-      .select("*")
-      .eq("status", "approved")
-      .or(`expires_at.is.null,expires_at.gt.${new Date().toISOString()}`)
-      .order("created_date", { ascending: false });
+    const nowIso = new Date().toISOString();
 
-    if (error) throw error;
+    const jobs = await fetchAll(() =>
+      supabase
+        .from("jobs")
+        .select("*")
+        .eq("status", "approved")
+        .or(`expires_at.is.null,expires_at.gt.${nowIso}`)
+        .order("created_date", { ascending: false })
+        .order("id") // stable order so pages never overlap
+    );
 
-    const jobIds = jobs.map(j => j.id);
+    const jobIds = jobs.map((j) => j.id);
 
-    const [{ data: allReqTags }, { data: allRespTags }] = await Promise.all([
-      supabase.from("requirements_tags").select("*").in("job_id", jobIds).order("sort_order"),
-      supabase.from("responsibilities_tags").select("*").in("job_id", jobIds).order("sort_order"),
+    const [allReqTags, allRespTags] = await Promise.all([
+      fetchTags("requirements_tags", jobIds),
+      fetchTags("responsibilities_tags", jobIds),
     ]);
 
     const groupByJob = (rows) => {
       const map = {};
-      (rows || []).forEach(t => {
+      (rows || []).forEach((t) => {
         if (!map[t.job_id]) map[t.job_id] = [];
         map[t.job_id].push({ tag: t.tag, items: t.items });
       });
@@ -206,9 +249,12 @@ export const getJobs = async (req, res) => {
     const reqByJob = groupByJob(allReqTags);
     const respByJob = groupByJob(allRespTags);
 
-    const withPoster = await attachPosterInfo(jobs);
+    // attachPosterInfo uses .in("id", [...]) too, so run it in chunks as well
+    const withPoster = (
+      await Promise.all(chunk(jobs, 200).map((c) => attachPosterInfo(c)))
+    ).flat();
 
-    const result = withPoster.map(job => ({
+    const result = withPoster.map((job) => ({
       ...job,
       requirements: reqByJob[job.id]?.length > 0 ? reqByJob[job.id] : (job.requirements || []),
       responsibilities: respByJob[job.id]?.length > 0 ? respByJob[job.id] : (job.responsibilities || []),
@@ -220,6 +266,46 @@ export const getJobs = async (req, res) => {
   }
 };
 
+// ─── JOB COUNTS (real totals, not limited to 1000) ───────────────────────────
+// Route:  router.get("/counts", getJobCounts);   <-- put ABOVE router.get("/:id", ...)
+export const getJobCounts = async (req, res) => {
+  try {
+    const now = new Date().toISOString();
+    const head = () =>
+      supabase.from("jobs").select("id", { count: "exact", head: true }).neq("status", "draft");
+
+    const [total, active, expired, featured] = await Promise.all([
+      head(),
+      head().eq("status", "approved").or(`expires_at.is.null,expires_at.gt.${now}`),
+      head().lte("expires_at", now),
+      head().eq("is_featured", true),
+    ]);
+
+    for (const r of [total, active, expired, featured]) if (r.error) throw r.error;
+
+    res.json({
+      success: true,
+      data: {
+        total: total.count,
+        active: active.count,
+        expired: expired.count,
+        featured: featured.count,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// =============================================================================
+// ROUTE (jobRoutes.js)
+//   import { getJobCounts } from "../controllers/jobs.controller.js";
+//   router.get("/counts", getJobCounts);        // ABOVE router.get("/:id", ...)
+//
+// ONE MORE SMALL FIX in jobs.controller.js, inside getJobApplicants:
+//   change   .order("created_at", { ascending: false });
+//   to       .order("applied_at", { ascending: false });
+// =============================================================================
 // ─── GET JOB BY ID or SLUG ────────────────────────────────────────────────────
 export const getJobById = async (req, res) => {
   try {
