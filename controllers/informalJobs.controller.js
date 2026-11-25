@@ -1,15 +1,17 @@
-// ═══════════════════════════════════════════════════════════════════════════
+ // ═══════════════════════════════════════════════════════════════════════════
 // controllers/informalJobs.controller.js  (ONE file: posting + applying)
 //
 // Everything about informal jobs that changed: areas, informal pay, duration
-// plans (3 weeks / 1 month / 2 months), workers needed (+₦500 for 2 or 3),
-// one edit in the first 3 days, review days given back, and decline reasons.
+// plans (3 weeks / 1 month / 2 months), workers needed (+₦500 per extra worker),
+// who to hire (male / female / both, with how many of each), one edit in the
+// first 3 days, review days given back, and decline reasons.
 //
 // jobs.controller.js re-exports these five functions, so your routes do not
 // need to change:  submitInformalJob, updateInformalJob, approveJob,
 // rejectJob, getMyJobs
 //
-// Run jobnix-informal-migration.sql in Supabase BEFORE deploying this.
+// Run jobnix-informal-migration.sql AND jobnix-gender-migration.sql in Supabase
+// BEFORE deploying this.
 // Also holds: applyToInformalJob, getMyInformalApplications, setInformalJobTakenDown
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -49,7 +51,7 @@ const INFORMAL_PLANS = {
 };
 
 // Extra charge by number of workers needed. 1 worker = no extra.
-// 2 or 3 workers = ₦500 on top. Change the numbers here any time.
+// Every extra worker adds ₦500 on top. Change the numbers here any time.
 const MAX_WORKERS = 10;
 const WORKER_EXTRA_FEE = 500;
 const workerTopup = (n) => Math.max(0, n - 1) * WORKER_EXTRA_FEE;
@@ -112,10 +114,38 @@ const readWorkers = (value) => {
   return { workers: n };
 };
 
+// ── Who the employer wants to hire ─────────────────────────────────────────
+// "male"   -> all workers are men.
+// "female" -> all workers are women.
+// "both"   -> with 1 worker: either gender (no counts).
+//             with 2+ workers: how many men and how many women, at least 1 of
+//             each, and together they must equal the number of workers.
+// `workers` is the final number of workers for the job.
+// Returns { gender, male, female } or { error }.
+const GENDER_CHOICES = ["male", "female", "both"];
+
+const readGender = (body, workers) => {
+  const g = body.gender_preference;
+  if (!GENDER_CHOICES.includes(g)) {
+    return { error: "Choose who you want to hire: male, female or both." };
+  }
+  if (g === "male") return { gender: g, male: workers, female: 0 };
+  if (g === "female") return { gender: g, male: 0, female: workers };
+
+  // both
+  if (workers === 1) return { gender: g, male: null, female: null };
+  const m = Number(body.male_needed);
+  const f = Number(body.female_needed);
+  if (!Number.isInteger(m) || !Number.isInteger(f) || m < 1 || f < 1 || m + f !== workers) {
+    return { error: `Tell us how many men and how many women. They must add up to ${workers}.` };
+  }
+  return { gender: g, male: m, female: f };
+};
+
 // What the business pays: plan price + worker top-up.
 const priceFor = (planId, workers) =>
   (INFORMAL_PLANS[planId]?.fee ?? 0) + workerTopup(workers);
-  
+
 const formatDate = (d) =>
   new Date(d).toLocaleDateString("en-NG", { day: "numeric", month: "long", year: "numeric" });
 
@@ -253,6 +283,10 @@ export const submitInformalJob = async (req, res) => {
     const w = readWorkers(req.body.workers_needed);
     if (w.error) return res.status(400).json({ success: false, message: w.error });
 
+    // Who the employer wants to hire: male, female or both (and how many of each)
+    const gen = readGender(req.body, w.workers);
+    if (gen.error) return res.status(400).json({ success: false, message: gen.error });
+
     const isAgent = postAs === "agent";
     const cleanAgentName = String(agent_name ?? "").trim();
     const cleanAgentPhone = String(agent_phone ?? "").trim();
@@ -288,6 +322,11 @@ export const submitInformalJob = async (req, res) => {
         plan: planId,
         duration_days: plan.days,
         workers_needed: w.workers,
+
+        // Who the employer wants to hire
+        gender_preference: gen.gender,
+        male_needed: gen.male,
+        female_needed: gen.female,
 
         // Informal jobs are always one-click. Set here so the client can't send anything else.
         apply_method: "platform",
@@ -401,6 +440,12 @@ export const updateInformalJob = async (req, res) => {
       };
     }
 
+    // Who the employer wants to hire. The number of workers is the new one while the
+    // job is unpaid, otherwise the one that was already paid for.
+    const finalWorkers = planFields.workers_needed ?? existing.workers_needed;
+    const gen = readGender(req.body, finalWorkers);
+    if (gen.error) return res.status(400).json({ success: false, message: gen.error });
+
     // Keep the same slug suffix, regenerate the readable part in case title/location changed.
     const existingShortId = existing.slug?.split("-").pop() || Math.random().toString(36).slice(2, 8);
     const slug = generateSlug(cleanTitle, "", location, existingShortId);
@@ -424,6 +469,11 @@ export const updateInformalJob = async (req, res) => {
         candidate_state: extras.state,
         candidate_locations: extras.locations,
         ...planFields,
+
+        gender_preference: gen.gender,
+        male_needed: gen.male,
+        female_needed: gen.female,
+
         slug,
 
         posted_by_type: isAgent ? "agent" : "owner",
